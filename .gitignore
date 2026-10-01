@@ -1,0 +1,20 @@
+# Python caches and compiled files
+__pycache__/
+*.pyc
+
+# Build and environment directories
+build/
+dist/
+venv/
+.idea/
+
+# PyInstaller files
+*.spec
+
+# Offline caches and checkpoints
+*.pkl
+
+# Generated output and results folders
+results_*/
+plots/
+*.csv

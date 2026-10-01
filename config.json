@@ -1,0 +1,10 @@
+{
+    "na": 2,
+    "nb": 2,
+    "nc": 2,
+    "nk": 1,
+    "pop_size": 150,
+    "num_gen": 100,
+    "mutation_sigma": 0.5,
+    "checkpoint_freq": 10
+}
