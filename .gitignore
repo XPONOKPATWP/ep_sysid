@@ -2,19 +2,21 @@
 __pycache__/
 *.pyc
 
-# Build and environment directories
-build/
-dist/
+# Environments and IDE
+.venv/
 venv/
 .idea/
 
-# PyInstaller files
+# Builds and specs
+build/
+dist/
 *.spec
 
-# Offline caches and checkpoints
+# Caches and checkpoints
 *.pkl
 
-# Generated output and results folders
+# Results and outputs
+results/
 results_*/
 plots/
 *.csv
