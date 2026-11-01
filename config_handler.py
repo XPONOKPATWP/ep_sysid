@@ -44,6 +44,10 @@ DEFAULT_HYPERPARAMETERS = {
     "k_folds": 10,
     "random_seed": 42,
     "early_stop_patience": 50,
+    "early_stop_tol": 1e-6,
+    "early_stop_rel_tol": 1e-4,
+    "lamarckian_refine_freq": 5,
+    "refine_top_candidates": 6,
     "l2_reg": 0.0001,
     "crossover_alpha": 0.25,
     "stability_threshold": 0.98,
@@ -91,7 +95,8 @@ def load_hyperparameters(filepath="config.json"):
     with open(filepath, "r", encoding="utf-8") as file:
         parsed_json = json.load(file)
 
-    merged = {k: parsed_json.get(k, v) for k, v in DEFAULT_HYPERPARAMETERS.items()}
+    merged = DEFAULT_HYPERPARAMETERS.copy()
+    merged.update(parsed_json)
     merged["system_mode"] = str(merged.get("system_mode", "SISO")).upper().strip()
     return merged
 

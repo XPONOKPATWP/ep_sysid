@@ -705,13 +705,35 @@ def execute_evolutionary_programming(u_train, y_train, hyperparameters, stop_eve
             hall_of_fame.update(offspring_pool)
             is_final_gen = (generation == hyperparameters["num_gen"])
 
-            # Optimize the linear output weights with Ridge regression every few generations
-            if model_type == "MLP" and (generation % ckpt_freq == 0 or is_final_gen) and len(hall_of_fame) > 0:
-                refined_elite = refine_best_genome_lamarckian(hall_of_fame[0], u_train, y_train, hyperparameters, local_mlp_cache)
-                if refined_elite.fitness.values[0] < hall_of_fame[0].fitness.values[0]:
-                    hall_of_fame.update([refined_elite])
-                    worst_off_idx = int(np.argmax([ind.fitness.values[0] for ind in offspring_pool]))
-                    offspring_pool[worst_off_idx] = ep_toolbox.clone(refined_elite)
+            # Decoupled Lamarckian Ridge refinement for MLP: refine incumbent elite + top candidate offspring
+            refine_interval = max(1, int(hyperparameters.get("lamarckian_refine_freq", 5)))
+            if model_type == "MLP" and (generation % refine_interval == 0 or is_final_gen):
+                if len(hall_of_fame) > 0:
+                    refined_elite = refine_best_genome_lamarckian(
+                        hall_of_fame[0], u_train, y_train, hyperparameters, local_mlp_cache
+                    )
+                    if refined_elite.fitness.values[0] < hall_of_fame[0].fitness.values[0]:
+                        hall_of_fame.update([refined_elite])
+                        worst_off_idx = int(np.argmax([ind.fitness.values[0] for ind in offspring_pool]))
+                        offspring_pool[worst_off_idx] = ep_toolbox.clone(refined_elite)
+
+                top_k_refine = max(0, int(hyperparameters.get("refine_top_candidates", 6)))
+                if top_k_refine > 0 and len(offspring_pool) > 0:
+                    sorted_off_idx = np.argsort([ind.fitness.values[0] for ind in offspring_pool])
+                    n_top = min(len(sorted_off_idx), max(1, top_k_refine // 2))
+                    candidate_indices = list(sorted_off_idx[:n_top])
+                    remaining_idx = list(sorted_off_idx[n_top:])
+                    if remaining_idx and top_k_refine > n_top:
+                        n_rand = min(len(remaining_idx), top_k_refine - n_top)
+                        candidate_indices.extend(random.sample(remaining_idx, n_rand))
+
+                    for cand_idx in candidate_indices:
+                        refined_cand = refine_best_genome_lamarckian(
+                            offspring_pool[cand_idx], u_train, y_train, hyperparameters, local_mlp_cache
+                        )
+                        if refined_cand.fitness.values[0] < offspring_pool[cand_idx].fitness.values[0]:
+                            offspring_pool[cand_idx] = ep_toolbox.clone(refined_cand)
+                            hall_of_fame.update([refined_cand])
 
             population[:] = ep_toolbox.select(population + offspring_pool, pop_size)
             # Elitism: make sure the best individual is preserved
@@ -731,26 +753,33 @@ def execute_evolutionary_programming(u_train, y_train, hyperparameters, stop_eve
 
             if patience is not None:
                 historical_mins = ep_logbook.select("min")
-                if len(historical_mins) > patience and historical_mins[-1] < 1e5 and abs(historical_mins[-1] - historical_mins[-patience - 1]) < tol:
-                    if model_type == "MLP" and len(hall_of_fame) > 0:
-                        refined_final = refine_best_genome_lamarckian(
-                            hall_of_fame[0], u_train, y_train, hyperparameters, local_mlp_cache
-                        )
-                        if refined_final.fitness.values[0] < hall_of_fame[0].fitness.values[0]:
-                            hall_of_fame.update([refined_final])
-                            worst_idx = int(np.argmax([ind.fitness.values[0] for ind in population]))
-                            population[worst_idx] = ep_toolbox.clone(refined_final)
-                            if len(ep_logbook) > 0:
-                                ep_logbook[-1]["min"] = float(refined_final.fitness.values[0])
-                    total_el = current_total_elapsed()
-                    ep_logbook.elapsed_time = total_el
-                    print(f"[*] Converged early at generation {generation} (Patience: {patience}, Tol: {tol:.1e}, Elapsed: {total_el:.2f}s).")
-                    if checkpoint_path:
-                        save_checkpoint_state(
-                            population, generation, hall_of_fame, ep_logbook, checkpoint_path,
-                            config=hyperparameters, is_completed=True, elapsed_time=total_el
-                        )
-                    break
+                if len(historical_mins) > patience and historical_mins[-1] < 1e5:
+                    old_mse = float(historical_mins[-patience - 1])
+                    cur_mse = float(historical_mins[-1])
+                    abs_diff = abs(cur_mse - old_mse)
+                    rel_tol = float(hyperparameters.get("early_stop_rel_tol", 1e-4))
+                    rel_diff = abs_diff / max(1e-8, abs(old_mse))
+
+                    if abs_diff < tol and rel_diff < rel_tol:
+                        if model_type == "MLP" and len(hall_of_fame) > 0:
+                            refined_final = refine_best_genome_lamarckian(
+                                hall_of_fame[0], u_train, y_train, hyperparameters, local_mlp_cache
+                            )
+                            if refined_final.fitness.values[0] < hall_of_fame[0].fitness.values[0]:
+                                hall_of_fame.update([refined_final])
+                                worst_idx = int(np.argmax([ind.fitness.values[0] for ind in population]))
+                                population[worst_idx] = ep_toolbox.clone(refined_final)
+                                if len(ep_logbook) > 0:
+                                    ep_logbook[-1]["min"] = float(refined_final.fitness.values[0])
+                        total_el = current_total_elapsed()
+                        ep_logbook.elapsed_time = total_el
+                        print(f"[*] Converged early at generation {generation} (Patience: {patience}, Abs Tol: {tol:.1e}, Rel Tol: {rel_tol:.1e}, Elapsed: {total_el:.2f}s).")
+                        if checkpoint_path:
+                            save_checkpoint_state(
+                                population, generation, hall_of_fame, ep_logbook, checkpoint_path,
+                                config=hyperparameters, is_completed=True, elapsed_time=total_el
+                            )
+                        break
 
             if checkpoint_path and (generation % ckpt_freq == 0 or is_final_gen):
                 total_el = current_total_elapsed()
