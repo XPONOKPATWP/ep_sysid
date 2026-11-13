@@ -41,6 +41,18 @@ def compute_mse(actual_targets, predicted_outputs):
         return 1e6
 
 
+def compute_mae(actual_targets, predicted_outputs):
+    # Calculates Mean Absolute Error (MAE) across all samples and output channels
+    try:
+        y_t, y_p = _align_signal_shapes(actual_targets, predicted_outputs)
+        if len(y_t) == 0 or len(y_p) == 0:
+            return 1e6
+        mae = float(np.mean(np.abs(y_t - y_p)))
+        return mae if (np.isfinite(mae) and mae <= 1e12) else 1e6
+    except (ValueError, TypeError):
+        return 1e6
+
+
 def compute_mape(actual_targets, predicted_outputs):
     # Mean Absolute Percentage Error ignoring near-zero targets (< 1e-5)
     y_true, y_pred = _align_signal_shapes(actual_targets, predicted_outputs)
@@ -78,6 +90,27 @@ def _compute_channelwise_nrmse_fit(y_true, y_pred):
         fit_c = (1.0 - (err_norm / denom)) * 100.0 if denom > 1e-12 else 0.0
         fits.append(fit_c)
     return float(np.mean(fits)) if fits else 0.0
+
+
+def compute_vaf(actual_targets, predicted_outputs):
+    # Calculates Variance Accounted For (VAF) percentage across output channels
+    yt, yp = _align_signal_shapes(actual_targets, predicted_outputs)
+    if yt.ndim == 1:
+        yt = yt.reshape(-1, 1)
+    if yp.ndim == 1:
+        yp = yp.reshape(-1, 1)
+    if len(yt) == 0 or len(yp) == 0:
+        return 0.0
+    vafs = []
+    for ch in range(min(yt.shape[1], yp.shape[1])):
+        yc = yt[:, ch]
+        yp_c = yp[:, ch]
+        ec = yc - yp_c
+        var_y = float(np.var(yc))
+        var_e = float(np.var(ec))
+        vaf_c = max(-1000.0, (1.0 - (var_e / var_y)) * 100.0) if var_y > 1e-12 else 0.0
+        vafs.append(vaf_c)
+    return float(np.mean(vafs)) if vafs else 0.0
 
 
 def _acf_pass_rate_1d(residuals_1d, max_lag=40):
@@ -173,8 +206,8 @@ def compute_cross_correlation_pass_rate(u_aligned, actual_targets, predicted_out
     return float(np.mean(pair_rates)) if pair_rates else 100.0
 
 
-def generate_validation_report(actual_targets, predicted_outputs, model_parameter_count=6, simulated_outputs=None):
-    # Compiles model validation metrics (MSE, RMSE, MAPE, R2, AIC, BIC, and simulation fit)
+def generate_validation_report(actual_targets, predicted_outputs, model_parameter_count=6, simulated_outputs=None, u_inputs=None):
+    # Compiles model validation metrics (MSE, RMSE, MAPE, R2, VAF, AIC, BIC, and simulation fit)
     y_true, y_pred = _align_signal_shapes(actual_targets, predicted_outputs)
 
     sample_size = len(y_true)
@@ -211,14 +244,19 @@ def generate_validation_report(actual_targets, predicted_outputs, model_paramete
     report = {
         "MSE": mse_score,
         "RMSE": rmse_score,
+        "MAE": compute_mae(y_true, y_pred),
         "MAPE": compute_mape(y_true, y_pred),
         "R-Squared": r2_val,
+        "VAF_Pct": compute_vaf(y_true, y_pred),
         "AIC": aic_score,
         "AICc": aicc_score,
         "BIC": bic_score,
         "FPE": fpe_score,
         "White_Noise_Pct": compute_white_noise_pass_rate(y_true, y_pred)
     }
+
+    if u_inputs is not None:
+        report["CCF_Pass_Pct"] = compute_cross_correlation_pass_rate(u_inputs, y_true, y_pred)
 
     if simulated_outputs is not None:
         y_true_sim, y_sim = _align_signal_shapes(actual_targets, simulated_outputs)

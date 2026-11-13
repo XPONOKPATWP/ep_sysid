@@ -194,7 +194,10 @@ def _parse_serialized_model(model_filepath):
             "scaler_u": u_scaler,
             "scaler_y": y_scaler,
             "svr_u_train": svr_u_train,
-            "svr_y_train": svr_y_train
+            "svr_y_train": svr_y_train,
+            "mean_fe": parsed_data.get("mean_fe"),
+            "total_fe": parsed_data.get("total_fe"),
+            "mean_execution_time": parsed_data.get("mean_execution_time")
         }
 
     else:
@@ -207,6 +210,25 @@ def _parse_serialized_model(model_filepath):
         required_keys = {"structure", "best_fold_theta", "scaler_u", "scaler_y"}
         if not isinstance(model_payload, dict) or not required_keys.issubset(model_payload.keys()):
             raise ValueError("Invalid PKL model format.")
+
+        # If mean_fe or mean_execution_time is not directly stored in payload, inspect surrounding directory
+        if "mean_fe" not in model_payload or model_payload["mean_fe"] is None:
+            model_dir = os.path.dirname(os.path.abspath(model_filepath))
+            rep_path = os.path.join(model_dir, "training_report.txt")
+            if os.path.exists(rep_path):
+                try:
+                    fe_matches = re.findall(r"FE:\s*(\d+)", open(rep_path, "r", encoding="utf-8", errors="replace").read())
+                    if fe_matches:
+                        fe_vals = [int(v) for v in fe_matches]
+                        model_payload["mean_fe"] = float(np.mean(fe_vals))
+                        model_payload["total_fe"] = int(np.sum(fe_vals))
+                    time_matches = re.findall(r"Time:\s*([\d.]+)s", open(rep_path, "r", encoding="utf-8", errors="replace").read())
+                    if time_matches:
+                        t_vals = [float(v) for v in time_matches]
+                        model_payload["mean_execution_time"] = float(np.mean(t_vals))
+                except Exception:
+                    pass
+
         return model_payload
 
 
@@ -383,6 +405,10 @@ def execute_inference_pipeline(model_filepath, u_raw, y_raw, target_dataset_name
 
     execution_elapsed = time.perf_counter() - execution_start
 
+    mean_fe = model_payload.get("mean_fe")
+    total_fe = model_payload.get("total_fe")
+    mean_train_time = model_payload.get("mean_execution_time")
+
     report_filepath = os.path.join(output_dir, "inference_report.txt")
     with open(report_filepath, "w", encoding="utf-8") as file:
         file.write("=== Single-Model Deep Evaluation & Diagnostic Report ===\n")
@@ -392,7 +418,18 @@ def execute_inference_pipeline(model_filepath, u_raw, y_raw, target_dataset_name
         file.write(f"Trained On           : {source_dataset} (Fold {winning_fold_index:02d})\n")
         file.write(f"Evaluated On         : {target_dataset_name} (N = {len(y_actual_unscaled)} aligned samples, Burn-in Lag = {max_delay_lag})\n")
         file.write(f"Architecture         : {arch_summary}\n")
-        file.write(f"Time Taken           : {execution_elapsed:.4f} seconds\n")
+        if mean_fe is not None and total_fe is not None:
+            file.write(f"Training Budget (FE) : {int(mean_fe):,d} FE / fold ({int(total_fe):,d} Total FE across 10 folds)\n")
+        elif mean_fe is not None:
+            file.write(f"Training Budget (FE) : {int(mean_fe):,d} FE / fold\n")
+        elif total_fe is not None:
+            file.write(f"Training Budget (FE) : {int(total_fe):,d} Total FE\n")
+
+        if mean_train_time is not None:
+            cost_str = f" (~{(mean_train_time * 1000.0) / max(1, mean_fe):.2f} ms/FE)" if mean_fe else ""
+            file.write(f"Training Time        : {mean_train_time:.2f} seconds / fold{cost_str}\n")
+
+        file.write(f"Inference Time       : {execution_elapsed:.4f} seconds (Deterministic forward pass, 0 new FE)\n")
 
         file.write("\n--- 1. Best-Fold Identified Parameters ---\n")
         for name, val in zip(parameter_names, best_theta_weights):
@@ -485,9 +522,9 @@ def generate_latex_results_table(fold_telemetry, parameter_names, mean_theta_arr
         r"\centering",
         rf"\caption{{{num_folds_run}-Fold Cross-Validation Performance for {model_type} ({system_mode}) on {clean_ds}}}",
         rf"\label{{tab:results_{dataset_name.lower()}_{model_type.lower()}}}",
-        r"\begin{tabular}{lcccccccc}",
+        r"\begin{tabular}{lccccccccc}",
         r"\toprule",
-        r"\textbf{Metric} & \textbf{MSE} & \textbf{RMSE} & \textbf{MAPE (\%)} & \textbf{$R^2$} & \textbf{AIC} & \textbf{BIC} & \textbf{ACF Pass (\%)} & \textbf{Time (s)} \\",
+        r"\textbf{Metric} & \textbf{MSE} & \textbf{RMSE} & \textbf{MAE} & \textbf{MAPE (\%)} & \textbf{$R^2$} & \textbf{AIC} & \textbf{BIC} & \textbf{ACF (\%)} & \textbf{Time (s)} \\",
         r"\midrule"
     ]
 
@@ -495,6 +532,9 @@ def generate_latex_results_table(fold_telemetry, parameter_names, mean_theta_arr
     std_mse = np.std(fold_telemetry["MSE"])
     mean_rmse = np.mean(fold_telemetry["RMSE"])
     std_rmse = np.std(fold_telemetry["RMSE"])
+    mae_list = fold_telemetry.get("MAE") or [0.0] * len(fold_telemetry["MSE"])
+    mean_mae = np.mean(mae_list)
+    std_mae = np.std(mae_list)
     mean_mape = np.mean(fold_telemetry["MAPE"])
     std_mape = np.std(fold_telemetry["MAPE"])
     mean_r2 = np.mean(fold_telemetry["R-Squared"])
@@ -511,34 +551,59 @@ def generate_latex_results_table(fold_telemetry, parameter_names, mean_theta_arr
     best_idx = int(np.argmin(fold_telemetry["MSE"]))
 
     lines.append(
-        rf"Mean ($\mu$) & {mean_mse:.4f} & {mean_rmse:.4f} & {mean_mape:.2f} & {mean_r2:.4f} & {mean_aic:.1f} & {mean_bic:.1f} & {mean_wn:.1f} & {mean_time:.2f} \\"
+        rf"Mean ($\mu$) & {mean_mse:.4f} & {mean_rmse:.4f} & {mean_mae:.4f} & {mean_mape:.2f} & {mean_r2:.4f} & {mean_aic:.1f} & {mean_bic:.1f} & {mean_wn:.1f} & {mean_time:.2f} \\"
     )
     lines.append(
-        rf"Std ($\sigma$) & $\pm${std_mse:.4f} & $\pm${std_rmse:.4f} & $\pm${std_mape:.2f} & $\pm${std_r2:.4f} & $\pm${std_aic:.1f} & $\pm${std_bic:.1f} & $\pm${std_wn:.1f} & $\pm${std_time:.2f} \\"
+        rf"Std ($\sigma$) & $\pm${std_mse:.4f} & $\pm${std_rmse:.4f} & $\pm${std_mae:.4f} & $\pm${std_mape:.2f} & $\pm${std_r2:.4f} & $\pm${std_aic:.1f} & $\pm${std_bic:.1f} & $\pm${std_wn:.1f} & $\pm${std_time:.2f} \\"
     )
     lines.append(
-        rf"Best Fold & \textbf{{{fold_telemetry['MSE'][best_idx]:.4f}}} & \textbf{{{fold_telemetry['RMSE'][best_idx]:.4f}}} & {fold_telemetry['MAPE'][best_idx]:.2f} & \textbf{{{fold_telemetry['R-Squared'][best_idx]:.4f}}} & {fold_telemetry['AIC'][best_idx]:.1f} & {fold_telemetry['BIC'][best_idx]:.1f} & {fold_telemetry['White_Noise_Pct'][best_idx]:.1f} & {fold_telemetry['Execution_Time_Sec'][best_idx]:.2f} \\"
+        rf"Best Fold & \textbf{{{fold_telemetry['MSE'][best_idx]:.4f}}} & \textbf{{{fold_telemetry['RMSE'][best_idx]:.4f}}} & \textbf{{{mae_list[best_idx]:.4f}}} & {fold_telemetry['MAPE'][best_idx]:.2f} & \textbf{{{fold_telemetry['R-Squared'][best_idx]:.4f}}} & {fold_telemetry['AIC'][best_idx]:.1f} & {fold_telemetry['BIC'][best_idx]:.1f} & {fold_telemetry['White_Noise_Pct'][best_idx]:.1f} & {fold_telemetry['Execution_Time_Sec'][best_idx]:.2f} \\"
     )
+
+    if "Fitness_Evaluations" in fold_telemetry and len(fold_telemetry["Fitness_Evaluations"]) > 0:
+        mean_fe = np.mean(fold_telemetry["Fitness_Evaluations"])
+        std_fe = np.std(fold_telemetry["Fitness_Evaluations"])
+        lines.append(r"\midrule")
+        lines.append(rf"Fitness Evals (FE) & \multicolumn{{9}}{{c}}{{Mean: {mean_fe:.0f} $\pm$ {std_fe:.0f}}} \\")
 
     if "Sim_Fit_Pct" in fold_telemetry and len(fold_telemetry["Sim_Fit_Pct"]) > 0:
         mean_sim = np.mean(fold_telemetry["Sim_Fit_Pct"])
         std_sim = np.std(fold_telemetry["Sim_Fit_Pct"])
         best_sim = fold_telemetry["Sim_Fit_Pct"][best_idx]
         lines.append(r"\midrule")
-        lines.append(rf"Simulation Fit (\%) & \multicolumn{{8}}{{c}}{{Mean: {mean_sim:.2f}\% $\pm$ {std_sim:.2f}\% \quad (Best Fold: \textbf{{{best_sim:.2f}\%}})}} \\")
+        lines.append(rf"Simulation Fit (\%) & \multicolumn{{9}}{{c}}{{Mean: {mean_sim:.2f}\% $\pm$ {std_sim:.2f}\% \quad (Best Fold: \textbf{{{best_sim:.2f}\%}})}} \\")
+
+    if "Sim_RMSE" in fold_telemetry and len(fold_telemetry["Sim_RMSE"]) > 0:
+        mean_s_rmse = np.mean(fold_telemetry["Sim_RMSE"])
+        std_s_rmse = np.std(fold_telemetry["Sim_RMSE"])
+        best_s_rmse = fold_telemetry["Sim_RMSE"][best_idx]
+        lines.append(rf"Simulation RMSE & \multicolumn{{9}}{{c}}{{Mean: {mean_s_rmse:.4f} $\pm$ {std_s_rmse:.4f} \quad (Best Fold: \textbf{{{best_s_rmse:.4f}}})}} \\")
+
+    if "VAF_Pct" in fold_telemetry and len(fold_telemetry["VAF_Pct"]) > 0:
+        mean_vaf = np.mean(fold_telemetry["VAF_Pct"])
+        std_vaf = np.std(fold_telemetry["VAF_Pct"])
+        best_vaf = fold_telemetry["VAF_Pct"][best_idx]
+        lines.append(r"\midrule")
+        lines.append(rf"Variance Accounted For (VAF \%) & \multicolumn{{9}}{{c}}{{Mean: {mean_vaf:.2f}\% $\pm$ {std_vaf:.2f}\% \quad (Best Fold: \textbf{{{best_vaf:.2f}\%}})}} \\")
+
+    if "CCF_Pass_Pct" in fold_telemetry and len(fold_telemetry["CCF_Pass_Pct"]) > 0:
+        mean_ccf = np.mean(fold_telemetry["CCF_Pass_Pct"])
+        std_ccf = np.std(fold_telemetry["CCF_Pass_Pct"])
+        best_ccf = fold_telemetry["CCF_Pass_Pct"][best_idx]
+        lines.append(rf"Input-Residual CCF Pass (\%) & \multicolumn{{9}}{{c}}{{Mean: {mean_ccf:.1f}\% $\pm$ {std_ccf:.1f}\% \quad (Best Fold: \textbf{{{best_ccf:.1f}\%}})}} \\")
 
     if "AICc" in fold_telemetry and len(fold_telemetry["AICc"]) > 0:
         mean_aicc = np.mean(fold_telemetry["AICc"])
         std_aicc = np.std(fold_telemetry["AICc"])
         best_aicc = fold_telemetry["AICc"][best_idx]
         lines.append(r"\midrule")
-        lines.append(rf"AICc & \multicolumn{{8}}{{c}}{{Mean: {mean_aicc:.2f} $\pm$ {std_aicc:.2f} \quad (Best Fold: \textbf{{{best_aicc:.2f}}})}} \\")
+        lines.append(rf"AICc & \multicolumn{{9}}{{c}}{{Mean: {mean_aicc:.2f} $\pm$ {std_aicc:.2f} \quad (Best Fold: \textbf{{{best_aicc:.2f}}})}} \\")
 
     if "FPE" in fold_telemetry and len(fold_telemetry["FPE"]) > 0:
         mean_fpe = np.mean(fold_telemetry["FPE"])
         std_fpe = np.std(fold_telemetry["FPE"])
         best_fpe = fold_telemetry["FPE"][best_idx]
-        lines.append(rf"FPE & \multicolumn{{8}}{{c}}{{Mean: {mean_fpe:.4f} $\pm$ {std_fpe:.4f} \quad (Best Fold: \textbf{{{best_fpe:.4f}}})}} \\")
+        lines.append(rf"FPE & \multicolumn{{9}}{{c}}{{Mean: {mean_fpe:.4f} $\pm$ {std_fpe:.4f} \quad (Best Fold: \textbf{{{best_fpe:.4f}}})}} \\")
 
     lines.extend([
         r"\bottomrule",
@@ -708,10 +773,11 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
     cross_val_splits = KFold(n_splits=k_folds, shuffle=False)
 
     fold_telemetry = {
-        "MSE": [], "RMSE": [], "MAPE": [], "R-Squared": [],
+        "MSE": [], "RMSE": [], "MAE": [], "MAPE": [], "R-Squared": [],
         "AIC": [], "AICc": [], "BIC": [], "FPE": [], "White_Noise_Pct": [],
-        "Sim_Fit_Pct": [],
-        "Generations": [], "Execution_Time_Sec": []
+        "Sim_Fit_Pct": [], "Sim_RMSE": [], "Sim_MSE": [],
+        "VAF_Pct": [], "CCF_Pass_Pct": [],
+        "Generations": [], "Fitness_Evaluations": [], "Execution_Time_Sec": [], "Cost_Per_FE_ms": []
     }
     fold_theta_matrices = []
     fold_scaler_objects = []
@@ -792,8 +858,14 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
         wall_fold_time = time.perf_counter() - fold_start
         saved_ckpt_time = float(getattr(ep_logbook, "elapsed_time", 0.0))
         fold_elapsed_time = saved_ckpt_time if saved_ckpt_time > 0.0 else wall_fold_time
+        total_fold_fevals = (
+            int(np.sum(ep_logbook.select("nevals")))
+            if (hasattr(ep_logbook, "header") and ep_logbook.header and "nevals" in ep_logbook.header)
+            else int(active_config.get("pop_size", 150) * (final_generation_reached + 1))
+        )
 
         fold_telemetry["Generations"].append(final_generation_reached)
+        fold_telemetry["Fitness_Evaluations"].append(total_fold_fevals)
         fold_telemetry["Execution_Time_Sec"].append(fold_elapsed_time)
         convergence_status = "Stopped Early" if final_generation_reached < max_generations else "Max Gen Reached"
 
@@ -827,6 +899,7 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
             )
 
         # Invert scaling back to original physical units before calculating metrics
+        u_actual_unscaled = _inverse_transform_nd(u_scaler, u_test_scaled[max_delay_lag:])
         y_actual_unscaled = _inverse_transform_nd(y_scaler, y_test_scaled[max_delay_lag:])
         y_pred_unscaled = _inverse_transform_nd(y_scaler, predicted_y_scaled[max_delay_lag:])
         y_sim_unscaled = _inverse_transform_nd(y_scaler, simulated_y_scaled[max_delay_lag:]) if simulated_y_scaled is not None else None
@@ -835,24 +908,38 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
 
         validation_scores = generate_validation_report(
             y_actual_unscaled, y_pred_unscaled, model_parameter_count=fold_param_count,
-            simulated_outputs=y_sim_unscaled
+            simulated_outputs=y_sim_unscaled, u_inputs=u_actual_unscaled
         )
         for key, value in validation_scores.items():
             if key in fold_telemetry:
                 fold_telemetry[key].append(value)
 
-        sim_str = f" | SimFit: {validation_scores['Sim_Fit_Pct']:>5.1f}%" if "Sim_Fit_Pct" in validation_scores else ""
+        cost_per_fe = (fold_elapsed_time * 1000.0) / max(1, total_fold_fevals)
+        fold_telemetry["Cost_Per_FE_ms"].append(cost_per_fe)
+
+        sim_fit_str = f" | SimFit: {validation_scores['Sim_Fit_Pct']:>5.1f}%" if "Sim_Fit_Pct" in validation_scores else ""
+        sim_rmse_str = f" | SimRMSE: {validation_scores['Sim_RMSE']:>8.4f}" if "Sim_RMSE" in validation_scores else ""
+        vaf_str = f" | VAF: {validation_scores['VAF_Pct']:>6.2f}%" if "VAF_Pct" in validation_scores else ""
+        ccf_str = f" | CCF%: {validation_scores['CCF_Pass_Pct']:>5.1f}%" if "CCF_Pass_Pct" in validation_scores else ""
+        aicc_str = f" | AICc: {validation_scores['AICc']:>8.4f}" if "AICc" in validation_scores else ""
+        fpe_str = f" | FPE: {validation_scores['FPE']:>8.4f}" if "FPE" in validation_scores else ""
+        cost_str = f" ({cost_per_fe:.2f}ms/FE)"
+
         status_line = (
             f"Fold {current_fold:02d} | Gen: {final_generation_reached:>3d}/{max_generations} ({convergence_status:<15}) | "
-            f"Time: {fold_elapsed_time:>5.2f}s | "
+            f"FE: {total_fold_fevals:>6d} | Time: {fold_elapsed_time:>5.2f}s{cost_str} | "
             f"MSE: {validation_scores['MSE']:>8.4f} | "
             f"RMSE: {validation_scores['RMSE']:>8.4f} | "
+            f"MAE: {validation_scores['MAE']:>8.4f} | "
             f"MAPE: {validation_scores['MAPE']:>5.2f}% | "
             f"R2: {validation_scores['R-Squared']:>7.4f} | "
-            f"AIC: {validation_scores['AIC']:>8.4f} | "
-            f"BIC: {validation_scores['BIC']:>8.4f} | "
+            f"AIC: {validation_scores['AIC']:>8.4f}"
+            f"{aicc_str} | "
+            f"BIC: {validation_scores['BIC']:>8.4f}"
+            f"{fpe_str} | "
             f"WN%: {validation_scores['White_Noise_Pct']:>5.1f}%"
-            f"{sim_str}"
+            f"{vaf_str}{ccf_str}"
+            f"{sim_fit_str}{sim_rmse_str}"
         )
         print(status_line)
         console_report_lines.append(status_line)
@@ -869,7 +956,12 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
                     "fold": current_fold,
                     "k_folds": k_folds,
                     "val_mse": float(validation_scores.get("MSE", 0.0)),
-                    "val_r2": float(validation_scores.get("R-Squared", 0.0))
+                    "val_rmse": float(validation_scores.get("RMSE", 0.0)),
+                    "val_r2": float(validation_scores.get("R-Squared", 0.0)),
+                    "val_vaf": float(validation_scores.get("VAF_Pct", 0.0)),
+                    "val_sim_fit": float(validation_scores.get("Sim_Fit_Pct", 0.0)),
+                    "fold_fe": total_fold_fevals,
+                    "fold_time": fold_elapsed_time
                 })
             except Exception:
                 pass
@@ -940,16 +1032,32 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
             summary_statistics.append(f"MAPE: {mean_val:.2f}% +/- {std_val:.2f}%")
         elif metric == "White_Noise_Pct":
             summary_statistics.append(f"White-Noise ACF Pass Rate: {mean_val:.1f}% +/- {std_val:.1f}%")
+        elif metric == "CCF_Pass_Pct":
+            summary_statistics.append(f"Cross-Correlation CCF Pass Rate: {mean_val:.1f}% +/- {std_val:.1f}%")
         elif metric == "Sim_Fit_Pct":
             summary_statistics.append(f"Autonomous Simulation Fit: {mean_val:.2f}% +/- {std_val:.2f}% (Best Fold: {fold_telemetry['Sim_Fit_Pct'][best_fold_index]:.2f}%)")
+        elif metric == "Sim_RMSE":
+            summary_statistics.append(f"Simulation RMSE: {mean_val:.4f} +/- {std_val:.4f}")
+        elif metric == "VAF_Pct":
+            summary_statistics.append(f"Variance Accounted For (VAF): {mean_val:.2f}% +/- {std_val:.2f}%")
         elif metric == "Generations":
             summary_statistics.append(f"Generations Run: {mean_val:.1f} +/- {std_val:.1f} (Max: {max_generations})")
+        elif metric == "Fitness_Evaluations":
+            summary_statistics.append(f"Fitness Evaluations: {mean_val:.0f} +/- {std_val:.0f}")
         elif metric == "Execution_Time_Sec":
             summary_statistics.append(f"Execution Time: {mean_val:.2f}s +/- {std_val:.2f}s")
+        elif metric == "Cost_Per_FE_ms":
+            summary_statistics.append(f"Cost per Evaluation: {mean_val:.3f}ms +/- {std_val:.3f}ms")
         else:
             summary_statistics.append(f"{metric}: {mean_val:.4f} +/- {std_val:.4f}")
 
     artifact_basename = _build_model_artifact_basename(output_dir, model_type, dataset_name)
+
+    fe_list = fold_telemetry.get("Fitness_Evaluations", [])
+    mean_fe_val = float(np.mean(fe_list)) if fe_list else None
+    total_fe_val = int(np.sum(fe_list)) if fe_list else None
+    time_list = fold_telemetry.get("Execution_Time_Sec", [])
+    mean_time_val = float(np.mean(time_list)) if time_list else None
 
     model_binary_payload = {
         "dataset": dataset_name,
@@ -964,7 +1072,11 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
         "scaler_u": best_u_scaler,
         "scaler_y": best_y_scaler,
         "svr_u_train": best_u_train_scaled if model_type == "SVR" else None,
-        "svr_y_train": best_y_train_scaled if model_type == "SVR" else None
+        "svr_y_train": best_y_train_scaled if model_type == "SVR" else None,
+        "training_telemetry": fold_telemetry,
+        "mean_fe": mean_fe_val,
+        "total_fe": total_fe_val,
+        "mean_execution_time": mean_time_val
     }
     pkl_filepath = os.path.join(output_dir, f"{artifact_basename}.pkl")
     tmp_pkl = pkl_filepath + ".tmp"
@@ -983,13 +1095,21 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
         "structure": structure_dict,
         "best_fold": winning_fold_number,
         "best_fold_mse": float(fold_telemetry["MSE"][best_fold_index]),
+        "best_fold_rmse": float(fold_telemetry["RMSE"][best_fold_index]),
+        "best_fold_r2": float(fold_telemetry["R-Squared"][best_fold_index]),
+        "best_fold_vaf": float(fold_telemetry["VAF_Pct"][best_fold_index]) if fold_telemetry.get("VAF_Pct") else None,
+        "best_fold_fe": int(fe_list[best_fold_index]) if fe_list else None,
+        "best_fold_time": float(time_list[best_fold_index]) if time_list else None,
         "best_fold_parameters": dict(zip(parameter_names, [float(v) for v in fold_theta_matrices[best_fold_index]])),
         "mean_10fold_parameters": dict(zip(parameter_names, [float(v) for v in mean_theta_array])),
         "std_10fold_parameters": dict(zip(parameter_names, [float(v) for v in std_theta_array])),
         "scaler_u": {"mean": u_mean_json, "std": u_std_json},
         "scaler_y": {"mean": y_mean_json, "std": y_std_json},
         "svr_u_train": best_u_train_scaled.tolist() if model_type == "SVR" else None,
-        "svr_y_train": best_y_train_scaled.tolist() if model_type == "SVR" else None
+        "svr_y_train": best_y_train_scaled.tolist() if model_type == "SVR" else None,
+        "mean_fe": mean_fe_val,
+        "total_fe": total_fe_val,
+        "mean_execution_time": mean_time_val
     }
     json_filepath = os.path.join(output_dir, f"{artifact_basename}.json")
     tmp_json = json_filepath + ".tmp"
@@ -1025,7 +1145,7 @@ def execute_kfold_training_pipeline(u_raw, y_raw, dataset_name, hyperparameters,
         for name, mean_val, std_val in zip(parameter_names, mean_theta_array, std_theta_array):
             file.write(f"{name}: {mean_val:>8.4f} +/- {std_val:.4f}\n")
 
-        file.write(f"\n--- Best Parameters (Fold {winning_fold_number:02d}, MSE: {fold_telemetry['MSE'][best_fold_index]:.4f}) ---\n")
+        file.write(f"\n--- Best Parameters (Fold {winning_fold_number:02d}, MSE: {fold_telemetry['MSE'][best_fold_index]:.4f}, RMSE: {fold_telemetry['RMSE'][best_fold_index]:.4f}, R2: {fold_telemetry['R-Squared'][best_fold_index]:.4f}) ---\n")
         for name, best_val in zip(parameter_names, fold_theta_matrices[best_fold_index]):
             file.write(f"{name}: {best_val:>8.4f}\n")
 
@@ -1153,10 +1273,22 @@ def execute_model_comparison_pipeline(model_filepaths, u_raw, y_raw, target_data
         u_scaled = _transform_nd(u_scaler, u_signal)
         y_scaled = _transform_nd(y_scaler, y_signal)
 
+        # Retrieve FE and training time
+        fe_val = model_payload.get("mean_fe") or model_payload.get("total_fe")
+        time_val = model_payload.get("mean_execution_time", 0.0)
+        if fe_val is None:
+            pop_sz = int(architecture.get("pop_size", 150))
+            n_gen = int(architecture.get("num_gen", 100))
+            fe_val = int(pop_sz * (n_gen + 1))
+        fe_val = int(fe_val)
+        time_val = float(time_val or 0.0)
+
+        predicted_sim_scaled = None
         if model_type == "ARMAX":
             total_parameters = get_armax_parameter_count(na, nb, nc, n_u=n_u, n_y=1)
             arch_str = f"ARMAX[{system_mode}](na={na},nb={nb},nc={nc},nk={nk})"
             predicted_y_scaled, max_delay_lag = simulate_armax_system(u_scaled, y_scaled, best_theta_weights, na, nb, nc, nk)
+            predicted_sim_scaled, _ = simulate_armax_free_run(u_scaled, y_scaled, best_theta_weights, na, nb, nc, nk)
         elif model_type == "SVR":
             total_parameters = get_svr_parameter_count(na, nb, n_u=n_u, n_y=n_y)
             arch_str = f"SVR[{system_mode}](na={na},nb={nb},nk={nk})"
@@ -1165,12 +1297,17 @@ def execute_model_comparison_pipeline(model_filepaths, u_raw, y_raw, target_data
                 u_train=model_payload.get("svr_u_train"), y_train=model_payload.get("svr_y_train"),
                 cross_domain=is_cross_domain
             )
+            predicted_sim_scaled, _ = simulate_svr_free_run(
+                u_scaled, y_scaled, best_theta_weights, na, nb, nk,
+                u_train=model_payload.get("svr_u_train"), y_train=model_payload.get("svr_y_train")
+            )
         else:
             total_parameters = get_mlp_parameter_count(na, nb, hidden_units, n_u=n_u, n_y=n_y)
             arch_str = f"MLP[{system_mode}](na={na},nb={nb},nk={nk},H={hidden_units})"
             u_in = np.clip(u_scaled, -3.0, 3.0) if is_cross_domain else u_scaled
             y_in = np.clip(y_scaled, -3.0, 3.0) if is_cross_domain else y_scaled
             predicted_y_scaled, max_delay_lag = simulate_mlp_system(u_in, y_in, best_theta_weights, na, nb, nk, hidden_units)
+            predicted_sim_scaled, _ = simulate_mlp_free_run(u_in, y_in, best_theta_weights, na, nb, nk, hidden_units)
             if is_cross_domain:
                 pred_valid = predicted_y_scaled[max_delay_lag:]
                 pred_std = np.std(pred_valid, axis=0, keepdims=True)
@@ -1181,26 +1318,40 @@ def execute_model_comparison_pipeline(model_filepaths, u_raw, y_raw, target_data
             raise RuntimeError(f"Model '{os.path.basename(filepath)}' produced unstable predictions.")
 
         y_unscaled_valid = _inverse_transform_nd(y_scaler, predicted_y_scaled[max_delay_lag:])
+        y_sim_unscaled_valid = _inverse_transform_nd(y_scaler, predicted_sim_scaled[max_delay_lag:]) if predicted_sim_scaled is not None else None
+
         # Extract reference output channel (1D) so SISO, MISO, SIMO, and MIMO models can be compared head-to-head
         if y_unscaled_valid.ndim > 1:
             safe_ch = min(max(0, ref_out_col), y_unscaled_valid.shape[1] - 1)
             y_unscaled_valid = y_unscaled_valid[:, safe_ch]
+        if y_sim_unscaled_valid is not None and y_sim_unscaled_valid.ndim > 1:
+            safe_ch = min(max(0, ref_out_col), y_sim_unscaled_valid.shape[1] - 1)
+            y_sim_unscaled_valid = y_sim_unscaled_valid[:, safe_ch]
 
         y_pred_full_unscaled = np.zeros_like(y_ref_1d, dtype=float)
         y_pred_full_unscaled[max_delay_lag:] = y_unscaled_valid
+
+        y_sim_full_unscaled = np.zeros_like(y_ref_1d, dtype=float)
+        if y_sim_unscaled_valid is not None:
+            y_sim_full_unscaled[max_delay_lag:] = y_sim_unscaled_valid
 
         raw_simulations.append({
             "label": label,
             "filepath": os.path.abspath(filepath),
             "model_type": model_type,
+            "system_mode": system_mode,
             "arch_str": arch_str,
             "param_count": total_parameters,
             "max_delay_lag": max_delay_lag,
-            "y_pred_full": y_pred_full_unscaled
+            "fe_val": fe_val,
+            "time_val": time_val,
+            "y_pred_full": y_pred_full_unscaled,
+            "y_sim_full": y_sim_full_unscaled
         })
 
     common_start_lag = max(item["max_delay_lag"] for item in raw_simulations)
     y_actual_aligned = y_ref_1d[common_start_lag:]
+    u_actual_aligned = u_raw[common_start_lag:] if u_raw is not None else None
 
     model_predictions_dict = {}
     model_metrics_dict = {}
@@ -1208,11 +1359,21 @@ def execute_model_comparison_pipeline(model_filepaths, u_raw, y_raw, target_data
     for item in raw_simulations:
         label = item["label"]
         y_pred_aligned = item["y_pred_full"][common_start_lag:]
+        y_sim_aligned = item["y_sim_full"][common_start_lag:]
         model_predictions_dict[label] = y_pred_aligned
-        scores = generate_validation_report(y_actual_aligned, y_pred_aligned, model_parameter_count=item["param_count"])
+        scores = generate_validation_report(
+            y_actual_aligned, y_pred_aligned,
+            model_parameter_count=item["param_count"],
+            simulated_outputs=y_sim_aligned,
+            u_inputs=u_actual_aligned
+        )
+        scores["FE"] = item["fe_val"]
+        scores["Execution_Time_Sec"] = item["time_val"]
+        scores["Cost_Per_FE_ms"] = (item["time_val"] * 1000.0) / max(1, item["fe_val"]) if (item["time_val"] and item["fe_val"]) else 0.0
         model_metrics_dict[label] = scores
         item["scores"] = scores
         item["y_pred_aligned"] = y_pred_aligned
+        item["y_sim_aligned"] = y_sim_aligned
 
     if progress_callback:
         progress_callback("Generating multi-model comparison plots and tables...")
@@ -1240,15 +1401,24 @@ def execute_model_comparison_pipeline(model_filepaths, u_raw, y_raw, target_data
 
     metrics_csv_path = os.path.join(output_dir, "comparison_metrics.csv")
     with open(metrics_csv_path, "w", encoding="utf-8") as f:
-        f.write("Rank,Model_Label,Architecture,MSE,RMSE,MAPE_Percent,R_Squared,AIC,BIC,White_Noise_Pct,Pred_At_Global_Max,Delta_Max,Pred_At_Global_Min,Delta_Min\n")
+        f.write(
+            "Rank,Dataset,System_Mode,Model_Label,Architecture,FE,MSE,RMSE,MAE,MAPE_Percent,R_Squared,VAF_Pct,AIC,AICc,BIC,FPE,"
+            "White_Noise_Pct,CCF_Pass_Pct,Sim_Fit_Pct,Sim_RMSE,Training_Time_Sec,Cost_ms_per_FE,Pred_At_Global_Max,Delta_Max,Pred_At_Global_Min,Delta_Min\n"
+        )
         for rank, m in enumerate(ranked_models, start=1):
             sc = m["scores"]
             p_max = float(m["y_pred_aligned"][max_idx])
             p_min = float(m["y_pred_aligned"][min_idx])
+            fe_str = str(sc.get("FE", ""))
+            time_str = f"{sc.get('Execution_Time_Sec', 0.0):.2f}"
+            cost_str = f"{sc.get('Cost_Per_FE_ms', 0.0):.3f}"
+            vaf_val = sc.get('VAF_Pct', 0.0)
+            ccf_val = sc.get('CCF_Pass_Pct', 100.0)
             f.write(
-                f"{rank},{m['label']},\"{m['arch_str']}\",{sc['MSE']:.6f},{sc['RMSE']:.6f},"
-                f"{sc['MAPE']:.4f},{sc['R-Squared']:.6f},{sc['AIC']:.4f},{sc['BIC']:.4f},{sc['White_Noise_Pct']:.1f},"
-                f"{p_max:.6f},{p_max - true_max_val:+.6f},{p_min:.6f},{p_min - true_min_val:+.6f}\n"
+                f"{rank},{target_dataset_name},{m.get('system_mode', 'SISO')},{m['label']},\"{m['arch_str']}\",{fe_str},{sc['MSE']:.6f},{sc['RMSE']:.6f},{sc.get('MAE', 0.0):.6f},"
+                f"{sc['MAPE']:.4f},{sc['R-Squared']:.6f},{vaf_val:.2f},{sc['AIC']:.4f},{sc.get('AICc', sc['AIC']):.4f},{sc['BIC']:.4f},{sc.get('FPE', 0.0):.6f},"
+                f"{sc['White_Noise_Pct']:.1f},{ccf_val:.1f},{sc.get('Sim_Fit_Pct', 0.0):.2f},{sc.get('Sim_RMSE', 0.0):.6f},"
+                f"{time_str},{cost_str},{p_max:.6f},{p_max - true_max_val:+.6f},{p_min:.6f},{p_min - true_min_val:+.6f}\n"
             )
 
     execution_elapsed = time.perf_counter() - execution_start
@@ -1262,14 +1432,15 @@ def execute_model_comparison_pipeline(model_filepaths, u_raw, y_raw, target_data
         file.write(f"Execution Time       : {execution_elapsed:.4f} seconds\n\n")
 
         file.write("--- 1. Overall Validation Metrics Table (Ranked by MSE) ---\n")
-        header = f"{'Rank':<5} | {'Model Label':<14} | {'Architecture':<32} | {'MSE':>10} | {'RMSE':>10} | {'MAPE':>8} | {'R-Squared':>10} | {'AIC':>11} | {'BIC':>11}"
+        header = f"{'Rank':<5} | {'Model Label':<14} | {'Architecture':<32} | {'FE':>7} | {'MSE':>9} | {'RMSE':>9} | {'MAE':>9} | {'MAPE':>7} | {'R-Squared':>9} | {'VAF (%)':>8} | {'AICc':>10} | {'BIC':>10} | {'ACF (%)':>8} | {'CCF (%)':>8} | {'Sim Fit (%)':>11} | {'Time (s)':>8}"
         file.write(header + "\n" + "-" * len(header) + "\n")
         for rank, m in enumerate(ranked_models, start=1):
             sc = m["scores"]
             file.write(
-                f"{rank:<5d} | {m['label']:<14} | {m['arch_str']:<32} | "
-                f"{sc['MSE']:>10.4f} | {sc['RMSE']:>10.4f} | {sc['MAPE']:>7.2f}% | "
-                f"{sc['R-Squared']:>10.4f} | {sc['AIC']:>11.2f} | {sc['BIC']:>11.2f}\n"
+                f"{rank:<5d} | {m['label']:<14} | {m['arch_str']:<32} | {sc.get('FE', 0):>7d} | "
+                f"{sc['MSE']:>9.4f} | {sc['RMSE']:>9.4f} | {sc.get('MAE', 0.0):>9.4f} | {sc['MAPE']:>6.2f}% | "
+                f"{sc['R-Squared']:>9.4f} | {sc.get('VAF_Pct', 0.0):>7.2f}% | {sc.get('AICc', sc['AIC']):>10.1f} | {sc['BIC']:>10.1f} | "
+                f"{sc['White_Noise_Pct']:>7.1f}% | {sc.get('CCF_Pass_Pct', 100.0):>7.1f}% | {sc.get('Sim_Fit_Pct', 0.0):>10.2f}% | {sc.get('Execution_Time_Sec', 0.0):>8.2f}\n"
             )
 
         file.write(f"\n--- 2. Extrema Reach Analysis (Global Max @ t={max_idx}: {true_max_val:.4f} | Global Min @ t={min_idx}: {true_min_val:.4f}) ---\n")
@@ -1286,6 +1457,31 @@ def execute_model_comparison_pipeline(model_filepaths, u_raw, y_raw, target_data
         file.write("\n--- 3. Source Model Files ---\n")
         for m in ranked_models:
             file.write(f"• {m['label']:<14} : {m['filepath']}\n")
+
+    # 4. Auto-generate LaTeX Comparison Table
+    tex_path = os.path.join(output_dir, "comparison_table.tex")
+    clean_ds = target_dataset_name.replace("_", r"\_")
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write(r"\begin{table*}[htbp]" + "\n" + r"\centering" + "\n")
+        f.write(rf"\caption{{Head-to-Head Multi-Model Comparison on {clean_ds}}}" + "\n")
+        lbl_tag = target_dataset_name.lower().replace("_", "")
+        f.write(rf"\label{{tab:model_comparison_{lbl_tag}}}" + "\n")
+        f.write(r"\begin{tabular}{llcccccccccccc}" + "\n" + r"\toprule" + "\n")
+        f.write(r"\textbf{Rank} & \textbf{Model} & \textbf{FE} & \textbf{MSE} & \textbf{RMSE} & \textbf{MAE} & \textbf{$R^2$} & \textbf{VAF (\%)} & \textbf{$AIC_c$} & \textbf{BIC} & \textbf{ACF (\%)} & \textbf{CCF (\%)} & \textbf{Sim Fit (\%)} & \textbf{Time (s)} \\" + "\n" + r"\midrule" + "\n")
+        for rank, m in enumerate(ranked_models, start=1):
+            sc = m["scores"]
+            is_best = (rank == 1)
+            b_open = "\\textbf{" if is_best else ""
+            b_close = "}" if is_best else ""
+            lbl_tex = m["label"].replace("_", "\\_")
+            fe_disp = sc.get("FE", 0)
+            f.write(
+                f"{rank} & {lbl_tex} & {fe_disp} & "
+                f"{b_open}{sc['MSE']:.4f}{b_close} & {b_open}{sc['RMSE']:.4f}{b_close} & {b_open}{sc.get('MAE', 0.0):.4f}{b_close} & "
+                f"{b_open}{sc['R-Squared']:.4f}{b_close} & {b_open}{sc.get('VAF_Pct', 0.0):.2f}\\%{b_close} & {sc.get('AICc', sc['AIC']):.1f} & {sc['BIC']:.1f} & "
+                f"{sc['White_Noise_Pct']:.1f}\\% & {sc.get('CCF_Pass_Pct', 100.0):.1f}\\% & {sc.get('Sim_Fit_Pct', 0.0):.2f}\\% & {sc.get('Execution_Time_Sec', 0.0):.2f} \\\\\n"
+            )
+        f.write(r"\bottomrule" + "\n" + r"\end{tabular}" + "\n" + r"\end{table*}" + "\n")
 
     print(f"\n[*] Model comparison complete! Saved to: {output_dir}")
     return ranked_models
@@ -1350,11 +1546,23 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
     comparison_rows = []
 
     fold_line_pattern = re.compile(
-        r"Fold\s+(\d+)\s*\|\s*Gen:\s*(\d+)/(\d+)\s*\(([^)]+)\)\s*\|\s*Time:\s*([\d.]+)s\s*\|\s*"
-        r"MSE:\s*([-\d.infnanINFNAN]+)\s*\|\s*RMSE:\s*([-\d.infnanINFNAN]+)\s*\|\s*MAPE:\s*([-\d.infnanINFNAN]+)%\s*\|\s*"
-        r"R2:\s*([-\d.infnanINFNAN]+)\s*\|\s*AIC:\s*([-\d.infnanINFNAN]+)"
-        r"(?:\s*\|\s*BIC:\s*([-\d.infnanINFNAN]+))?(?:\s*\|\s*WN%:\s*([-\d.infnanINFNAN]+)%)?"
-        r"(?:\s*\|\s*SimFit:\s*([-\d.infnanINFNAN]+)%)?"
+        r"Fold\s+(?P<fold>\d+)\s*\|\s*Gen:\s*(?P<gen>\d+)/(?P<max_gen>\d+)\s*\((?P<status>[^)]+)\)\s*\|"
+        r"(?:\s*FE:\s*(?P<fe>\d+)\s*\|)?"
+        r"\s*Time:\s*(?P<time>[\d.]+)s(?:\s*\((?P<cost>[\d.]+)ms/FE\))?\s*\|\s*"
+        r"MSE:\s*(?P<mse>[-\d.infnanINFNAN]+)\s*\|\s*"
+        r"RMSE:\s*(?P<rmse>[-\d.infnanINFNAN]+)\s*\|"
+        r"(?:\s*MAE:\s*(?P<mae>[-\d.infnanINFNAN]+)\s*\|)?"
+        r"\s*MAPE:\s*(?P<mape>[-\d.infnanINFNAN]+)%\s*\|\s*"
+        r"R2:\s*(?P<r2>[-\d.infnanINFNAN]+)\s*\|\s*"
+        r"AIC:\s*(?P<aic>[-\d.infnanINFNAN]+)"
+        r"(?:\s*\|\s*AICc:\s*(?P<aicc>[-\d.infnanINFNAN]+))?"
+        r"(?:\s*\|\s*BIC:\s*(?P<bic>[-\d.infnanINFNAN]+))?"
+        r"(?:\s*\|\s*FPE:\s*(?P<fpe>[-\d.infnanINFNAN]+))?"
+        r"(?:\s*\|\s*WN%:\s*(?P<wn>[-\d.infnanINFNAN]+)%)?"
+        r"(?:\s*\|\s*VAF:\s*(?P<vaf>[-\d.infnanINFNAN]+)%)?"
+        r"(?:\s*\|\s*CCF%:\s*(?P<ccf>[-\d.infnanINFNAN]+)%)?"
+        r"(?:\s*\|\s*SimFit:\s*(?P<simfit>[-\d.infnanINFNAN]+)%)?"
+        r"(?:\s*\|\s*SimRMSE:\s*(?P<simrmse>[-\d.infnanINFNAN]+))?"
     )
 
     def _safe_float(val_str):
@@ -1425,10 +1633,22 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                         continue
                     elif line.startswith("--- Best Parameters"):
                         section = "best_params"
-                        match = re.search(r"Fold\s+(\d+),\s*MSE:\s*([-\d.infnanINFNAN]+)", line)
+                        match = re.search(
+                            r"Fold\s+(\d+),\s*MSE:\s*([-\d.infnanINFNAN]+)"
+                            r"(?:,\s*RMSE:\s*([-\d.infnanINFNAN]+))?"
+                            r"(?:,\s*R2:\s*([-\d.infnanINFNAN]+))?",
+                            line
+                        )
                         if match:
                             row_data["Best_Fold"] = int(match.group(1))
-                            row_data["Best_Fold_MSE"] = _safe_float(match.group(2))
+                            b_mse = _safe_float(match.group(2))
+                            row_data["Best_Fold_MSE"] = b_mse
+                            if match.group(3):
+                                row_data["Best_Fold_RMSE"] = _safe_float(match.group(3))
+                            elif isinstance(b_mse, (int, float)) and b_mse >= 0:
+                                row_data["Best_Fold_RMSE"] = round(float(np.sqrt(b_mse)), 4)
+                            if match.group(4):
+                                row_data["Best_Fold_R2"] = _safe_float(match.group(4))
                         continue
                     elif line.startswith("--- Cross-Validation Summary ---"):
                         section = "cv_summary"
@@ -1455,19 +1675,28 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                     elif section == "folds":
                         m = fold_line_pattern.search(line)
                         if m:
+                            gd = m.groupdict()
                             fold_metrics_list.append({
-                                "Fold": int(m.group(1)),
-                                "Generations": f"{m.group(2)}/{m.group(3)}",
-                                "Status": m.group(4).strip(),
-                                "Time_Sec": _safe_float(m.group(5)),
-                                "MSE": _safe_float(m.group(6)),
-                                "RMSE": _safe_float(m.group(7)),
-                                "MAPE_Pct": _safe_float(m.group(8)),
-                                "R_Squared": _safe_float(m.group(9)),
-                                "AIC": _safe_float(m.group(10)),
-                                "BIC": _safe_float(m.group(11)),
-                                "WN_Pct": _safe_float(m.group(12)),
-                                "SimFit_Pct": _safe_float(m.group(13)) if m.lastindex and m.lastindex >= 13 else ""
+                                "Fold": int(gd["fold"]),
+                                "Generations": f"{gd['gen']}/{gd['max_gen']}",
+                                "Status": gd["status"].strip(),
+                                "Fitness_Evaluations": int(gd["fe"]) if gd.get("fe") else "",
+                                "Time_Sec": _safe_float(gd["time"]),
+                                "Cost_Per_FE_ms": _safe_float(gd.get("cost")),
+                                "MSE": _safe_float(gd["mse"]),
+                                "RMSE": _safe_float(gd["rmse"]),
+                                "MAE": _safe_float(gd["mae"]) if gd.get("mae") else "",
+                                "MAPE_Pct": _safe_float(gd["mape"]),
+                                "R_Squared": _safe_float(gd["r2"]),
+                                "AIC": _safe_float(gd["aic"]),
+                                "AICc": _safe_float(gd.get("aicc")),
+                                "BIC": _safe_float(gd.get("bic")),
+                                "FPE": _safe_float(gd.get("fpe")),
+                                "WN_Pct": _safe_float(gd.get("wn")),
+                                "VAF_Pct": _safe_float(gd.get("vaf")),
+                                "CCF_Pct": _safe_float(gd.get("ccf")),
+                                "SimFit_Pct": _safe_float(gd.get("simfit")) if gd.get("simfit") else "",
+                                "Sim_RMSE": _safe_float(gd.get("simrmse")) if gd.get("simrmse") else ""
                             })
 
                     elif section == "fold_params":
@@ -1517,12 +1746,43 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                     "mutation_sigma",
                     row_data.get("_param_Initial Mutation Step (σ)", row_data.get("_param_Initial Mutation Step Size", ""))
                 )
+                mut_type_val = meta_hparams.get(
+                    "mutation_type",
+                    row_data.get("_param_Mutation Operator", "Gaussian")
+                )
+                sel_type_val = meta_hparams.get(
+                    "selection_type",
+                    row_data.get("_param_Selection Strategy", "Truncation")
+                )
+                tourn_val = meta_hparams.get(
+                    "tournament_size",
+                    row_data.get("_param_Tournament Competitors (q)", 4)
+                )
+                cx_alpha_val = meta_hparams.get(
+                    "crossover_alpha",
+                    row_data.get("_param_Crossover Alpha (α)", row_data.get("_param_crossover_alpha", 0.25))
+                )
+                inp_idx_val = str(meta_hparams.get("input_col_idx", row_data.get("_param_input_col_idx", "")))
+                out_idx_val = str(meta_hparams.get("output_col_idx", row_data.get("_param_output_col_idx", "")))
+                kf_val = meta_hparams.get("k_folds", len(fold_metrics_list) if fold_metrics_list else 10)
+                seed_val = meta_hparams.get("random_seed", "")
+                patience_val = meta_hparams.get("early_stop_patience", "")
+                reltol_val = meta_hparams.get("early_stop_rel_tol", "")
+                refine_freq_val = meta_hparams.get("lamarckian_refine_freq", "")
+                refine_top_val = meta_hparams.get("refine_top_candidates", "")
+                l2_val = meta_hparams.get("l2_reg", "")
 
                 row_data.update({
                     "na": na_val, "nb": nb_val, "nc": nc_val, "nk": nk_val,
                     "mlp_hidden_nodes": mlp_nodes, "pop_size": pop_val, "num_gen": gen_val,
-                    "crossover_prob": cx_val, "mutation_sigma": sig_val,
-                    "Parameter_Group": f"mode={row_data['System_Mode']}, na={na_val}, nb={nb_val}, nk={nk_val} | Pop={pop_val}, Gen={gen_val}, Cx={cx_val}, Sigma={sig_val}"
+                    "mutation_type": mut_type_val, "selection_type": sel_type_val,
+                    "tournament_size": tourn_val, "crossover_prob": cx_val,
+                    "crossover_alpha": cx_alpha_val, "mutation_sigma": sig_val,
+                    "k_folds": kf_val, "random_seed": seed_val,
+                    "early_stop_patience": patience_val, "early_stop_rel_tol": reltol_val,
+                    "lamarckian_refine_freq": refine_freq_val, "refine_top_candidates": refine_top_val,
+                    "l2_reg": l2_val, "input_col_idx": inp_idx_val, "output_col_idx": out_idx_val,
+                    "Parameter_Group": f"mode={row_data['System_Mode']}, na={na_val}, nb={nb_val}, nk={nk_val} | Pop={pop_val}, Gen={gen_val}, Mut={mut_type_val}, Sel={sel_type_val}, Cx={cx_val}, Sigma={sig_val}"
                 })
 
                 for k in list(row_data.keys()):
@@ -1548,15 +1808,23 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                         "Is_Best_Fold": "BEST" if f_idx == row_data.get("Best_Fold") else "",
                         "Generations": fm["Generations"],
                         "Status": fm["Status"],
+                        "Fitness_Evaluations": fm.get("Fitness_Evaluations", ""),
                         "Time_Sec": fm["Time_Sec"],
+                        "Cost_Per_FE_ms": fm.get("Cost_Per_FE_ms", ""),
                         "MSE": fm["MSE"],
                         "RMSE": fm["RMSE"],
+                        "MAE": fm.get("MAE", ""),
                         "MAPE_Pct": fm["MAPE_Pct"],
                         "R_Squared": fm["R_Squared"],
+                        "VAF_Pct": fm.get("VAF_Pct", ""),
                         "AIC": fm["AIC"],
+                        "AICc": fm.get("AICc", ""),
                         "BIC": fm["BIC"],
+                        "FPE": fm.get("FPE", ""),
                         "WN_Pct": fm["WN_Pct"],
+                        "CCF_Pct": fm.get("CCF_Pct", ""),
                         "SimFit_Pct": fm.get("SimFit_Pct", ""),
+                        "Sim_RMSE": fm.get("Sim_RMSE", ""),
                         "Fold_Parameters": fold_params_map.get(f_idx, ""),
                         "Folder": folder_name
                     })
@@ -1621,15 +1889,23 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                         "Is_Best_Fold": "",
                         "Generations": f"{gen_reached}/{meta_hparams.get('num_gen', '?')}",
                         "Status": "Fold Done" if is_done else f"Paused @ Gen {gen_reached}",
+                        "Fitness_Evaluations": (gen_reached * int(meta_hparams.get("pop_size", sig_dict.get("pop_size", 0)))) if (gen_reached and meta_hparams.get("pop_size", sig_dict.get("pop_size", 0))) else "",
                         "Time_Sec": round(el_time, 2),
+                        "Cost_Per_FE_ms": round((el_time * 1000.0) / max(1, (gen_reached * int(meta_hparams.get("pop_size", sig_dict.get("pop_size", 0))))), 3) if (gen_reached and meta_hparams.get("pop_size", sig_dict.get("pop_size", 0))) else "",
                         "MSE": round(best_train_mse, 4) if np.isfinite(best_train_mse) else "",
                         "RMSE": round(float(np.sqrt(best_train_mse)), 4) if np.isfinite(best_train_mse) else "",
+                        "MAE": "",
                         "MAPE_Pct": "",
                         "R_Squared": "",
+                        "VAF_Pct": "",
                         "AIC": "",
+                        "AICc": "",
                         "BIC": "",
+                        "FPE": "",
                         "WN_Pct": "",
+                        "CCF_Pct": "",
                         "SimFit_Pct": "",
+                        "Sim_RMSE": "",
                         "Fold_Parameters": "",
                         "Folder": folder_name
                     })
@@ -1647,7 +1923,20 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                 gen_val = meta_hparams.get("num_gen", "")
                 cx_val = meta_hparams.get("crossover_prob", "")
                 sig_val = meta_hparams.get("mutation_sigma", "")
-                param_grp = f"mode={meta_sys_mode}, na={na_val}, nb={nb_val}, nk={nk_val} | Pop={pop_val}, Gen={gen_val}, Cx={cx_val}, Sigma={sig_val}"
+                mut_type_val = meta_hparams.get("mutation_type", "Gaussian")
+                sel_type_val = meta_hparams.get("selection_type", "Truncation")
+                tourn_val = meta_hparams.get("tournament_size", 4)
+                cx_alpha_val = meta_hparams.get("crossover_alpha", 0.25)
+                inp_idx_val = str(meta_hparams.get("input_col_idx", ""))
+                out_idx_val = str(meta_hparams.get("output_col_idx", ""))
+                seed_val = meta_hparams.get("random_seed", "")
+                patience_val = meta_hparams.get("early_stop_patience", "")
+                reltol_val = meta_hparams.get("early_stop_rel_tol", "")
+                refine_freq_val = meta_hparams.get("lamarckian_refine_freq", "")
+                refine_top_val = meta_hparams.get("refine_top_candidates", "")
+                l2_val = meta_hparams.get("l2_reg", "")
+
+                param_grp = f"mode={meta_sys_mode}, na={na_val}, nb={nb_val}, nk={nk_val} | Pop={pop_val}, Gen={gen_val}, Mut={mut_type_val}, Sel={sel_type_val}, Cx={cx_val}, Sigma={sig_val}"
 
                 for pfr in partial_fold_rows:
                     pfr["Parameter_Group"] = param_grp
@@ -1661,10 +1950,17 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                     "System_Mode": meta_sys_mode,
                     "na": na_val, "nb": nb_val, "nc": nc_val, "nk": nk_val,
                     "mlp_hidden_nodes": mlp_nodes, "pop_size": pop_val, "num_gen": gen_val,
-                    "crossover_prob": cx_val, "mutation_sigma": sig_val,
+                    "mutation_type": mut_type_val, "selection_type": sel_type_val,
+                    "tournament_size": tourn_val, "crossover_prob": cx_val,
+                    "crossover_alpha": cx_alpha_val, "mutation_sigma": sig_val,
+                    "k_folds": expected_k, "random_seed": seed_val,
+                    "early_stop_patience": patience_val, "early_stop_rel_tol": reltol_val,
+                    "lamarckian_refine_freq": refine_freq_val, "refine_top_candidates": refine_top_val,
+                    "l2_reg": l2_val, "input_col_idx": inp_idx_val, "output_col_idx": out_idx_val,
                     "Parameter_Group": param_grp,
                     "Best_Fold": "",
                     "Best_Fold_MSE": round(float(np.min(partial_mses)), 4) if partial_mses else "",
+                    "Best_Fold_RMSE": round(float(np.sqrt(np.min(partial_mses))), 4) if partial_mses else "",
                     "CV_MSE": f"{np.mean(partial_mses):.4f} +/- {np.std(partial_mses):.4f} (Train Ckpt)" if partial_mses else "",
                     "Total_Time_Sec": round(float(np.sum(partial_times)), 2) if partial_times else "",
                     "Saved_Model": "(Unfinished)",
@@ -1692,6 +1988,24 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                         }
                         for h, val in zip(headers, vals):
                             comp_dict[h] = val
+
+                        # Backfill Dataset and System_Mode if missing in legacy comparison CSVs
+                        if "Dataset" not in comp_dict or not comp_dict["Dataset"]:
+                            folder_m = re.search(r"(?:BatchComparison|CheckComparison)_[^_]+_(.+?)_\d{8}_\d{6}", folder_name)
+                            if folder_m:
+                                comp_dict["Dataset"] = folder_m.group(1).replace("_", " ")
+                            else:
+                                comp_dict["Dataset"] = ""
+
+                        if "System_Mode" not in comp_dict or not comp_dict["System_Mode"]:
+                            arch_str = comp_dict.get("Architecture", "")
+                            if "[MIMO]" in arch_str:
+                                comp_dict["System_Mode"] = "MIMO"
+                            elif "[SISO]" in arch_str:
+                                comp_dict["System_Mode"] = "SISO"
+                            else:
+                                comp_dict["System_Mode"] = ""
+
                         comparison_rows.append(comp_dict)
             except Exception as e:
                 print(f"[!] Skipped comparison CSV '{comp_csv_path}': {e}")
@@ -1718,17 +2032,54 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
         ordered_cols = [
             "Subfolder_Group", "Run_Status", "Dataset", "Dataset_Samples", "IO_Channels", "Input_Range", "Output_Mean_Std", "Output_Min_Max",
             "Parameter_Group", "Model_Type", "System_Mode", "na", "nb", "nc", "nk", "mlp_hidden_nodes",
-            "pop_size", "num_gen", "crossover_prob", "mutation_sigma",
-            "Best_Fold", "Best_Fold_MSE", "CV_MSE", "CV_RMSE", "CV_MAPE", "CV_R-Squared",
-            "CV_AIC", "CV_AICc", "CV_BIC", "CV_FPE", "CV_White-Noise ACF Pass Rate", "CV_Autonomous Simulation Fit",
-            "CV_Generations Run", "CV_Execution Time", "Total_Time_Sec", "Saved_Model", "Folder"
+            "pop_size", "num_gen", "mutation_type", "selection_type", "tournament_size", "crossover_prob", "crossover_alpha", "mutation_sigma",
+            "k_folds", "random_seed", "early_stop_patience", "early_stop_rel_tol", "lamarckian_refine_freq", "refine_top_candidates", "l2_reg",
+            "input_col_idx", "output_col_idx",
+            "Best_Fold", "Best_Fold_MSE", "Best_Fold_RMSE", "Best_Fold_R2",
+            "CV_MSE", "CV_RMSE", "CV_MAE", "CV_MAPE", "CV_R-Squared", "CV_Variance Accounted For (VAF)",
+            "CV_AIC", "CV_AICc", "CV_BIC", "CV_FPE",
+            "CV_White-Noise ACF Pass Rate", "CV_Cross-Correlation CCF Pass Rate",
+            "CV_Autonomous Simulation Fit", "CV_Simulation RMSE",
+            "CV_Generations Run", "CV_Fitness Evaluations", "CV_Execution Time", "CV_Cost per Evaluation",
+            "Total_Time_Sec", "Saved_Model", "Folder"
         ]
         existing_cols = [c for c in ordered_cols if c in df_train.columns]
         extra_cols = [c for c in df_train.columns if c not in existing_cols]
         df_train = df_train[existing_cols + extra_cols]
 
     df_folds = pd.DataFrame(ordered_fold_rows) if ordered_fold_rows else pd.DataFrame()
+    if not df_folds.empty:
+        ordered_fold_cols = [
+            "Subfolder_Group", "Dataset", "Model_Type", "System_Mode", "Saved_Model",
+            "Parameter_Group", "Fold", "Is_Best_Fold", "Generations", "Status",
+            "Fitness_Evaluations", "Time_Sec", "Cost_Per_FE_ms",
+            "MSE", "RMSE", "MAE", "MAPE_Pct", "R_Squared", "VAF_Pct",
+            "AIC", "AICc", "BIC", "FPE",
+            "WN_Pct", "CCF_Pct", "SimFit_Pct", "Sim_RMSE",
+            "Fold_Parameters", "Folder"
+        ]
+        for col in ordered_fold_cols:
+            if col not in df_folds.columns:
+                df_folds[col] = ""
+        extra_fold_cols = [c for c in df_folds.columns if c not in ordered_fold_cols]
+        df_folds = df_folds[ordered_fold_cols + extra_fold_cols]
+
     df_comp = pd.DataFrame(comparison_rows) if comparison_rows else pd.DataFrame()
+    if not df_comp.empty:
+        ordered_comp_cols = [
+            "Subfolder_Group", "Comparison_Folder", "Rank", "Dataset", "System_Mode",
+            "Model_Label", "Architecture", "FE",
+            "MSE", "RMSE", "MAE", "MAPE_Percent", "R_Squared", "VAF_Pct",
+            "AIC", "AICc", "BIC", "FPE",
+            "White_Noise_Pct", "CCF_Pass_Pct", "Sim_Fit_Pct", "Sim_RMSE",
+            "Training_Time_Sec", "Cost_ms_per_FE",
+            "Pred_At_Global_Max", "Delta_Max", "Pred_At_Global_Min", "Delta_Min"
+        ]
+        for col in ordered_comp_cols:
+            if col not in df_comp.columns:
+                df_comp[col] = ""
+        extra_comp_cols = [c for c in df_comp.columns if c not in ordered_comp_cols]
+        df_comp = df_comp[ordered_comp_cols + extra_comp_cols]
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     csv_out_path = os.path.join(base_results_dir, f"results_summary_{timestamp}.csv")
@@ -1748,13 +2099,23 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
 
     xlsx_out_path = os.path.join(base_results_dir, f"results_summary_{timestamp}.xlsx")
     try:
-        with pd.ExcelWriter(xlsx_out_path) as writer:
-            if not df_train.empty:
-                df_train.to_excel(writer, sheet_name="Summary_Grouped_By_Params", index=False)
-            if not df_folds.empty:
-                df_folds.to_excel(writer, sheet_name="10Fold_Per_Model_Breakdown", index=False)
-            if not df_comp.empty:
-                df_comp.to_excel(writer, sheet_name="Model_Comparisons", index=False)
+        # Sanitize cell contents to stay well below Excel's hard limit of 32,767 characters per cell
+        def _sanitize_for_excel(df_in):
+            if df_in.empty:
+                return df_in
+            return df_in.map(lambda x: (x[:32000] + "... [TRUNCATED]") if isinstance(x, str) and len(x) > 32000 else x)
+
+        df_train_excel = _sanitize_for_excel(df_train)
+        df_folds_excel = _sanitize_for_excel(df_folds)
+        df_comp_excel = _sanitize_for_excel(df_comp)
+
+        with pd.ExcelWriter(xlsx_out_path, engine="openpyxl") as writer:
+            if not df_train_excel.empty:
+                df_train_excel.to_excel(writer, sheet_name="Summary_Grouped_By_Params", index=False)
+            if not df_folds_excel.empty:
+                df_folds_excel.to_excel(writer, sheet_name="10Fold_Per_Model_Breakdown", index=False)
+            if not df_comp_excel.empty:
+                df_comp_excel.to_excel(writer, sheet_name="Model_Comparisons", index=False)
 
             for sheet_name, worksheet in writer.sheets.items():
                 for col in worksheet.columns:
@@ -1769,5 +2130,12 @@ def generate_results_summary_sheet(base_results_dir="results", loaded_datasets=N
                     if col_letter and hasattr(worksheet, "column_dimensions") and col_letter in worksheet.column_dimensions:
                         worksheet.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 55)
         return xlsx_out_path
-    except Exception:
+    except ImportError as ie:
+        print(f"\n[!] Notice: 'openpyxl' is not installed in the active virtual environment ({sys.executable}).")
+        print("    To enable multi-sheet Excel (.xlsx) export, run: pip install openpyxl")
+        print(f"    Master summary exported successfully as CSV to:\n    {csv_out_path}\n")
+        return csv_out_path
+    except Exception as e:
+        print(f"\n[!] Warning: Could not write Excel workbook: {e}")
+        print(f"    Master summary exported successfully as CSV to:\n    {csv_out_path}\n")
         return csv_out_path

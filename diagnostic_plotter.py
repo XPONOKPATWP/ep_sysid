@@ -427,7 +427,8 @@ def generate_cross_validation_summary(fold_metrics_dict, fold_parameter_matrix, 
 
 
 def generate_benchmark_boxplots(benchmark_scores_dict, output_dir="results_benchmarks"):
-    # Generates a log-scale boxplot of final objective values across benchmark functions
+    # Generates a log-scale boxplot of final objective values across benchmark functions.
+    # Supports both single-algorithm dicts {"Sphere": [...]} and multi-algorithm dicts {"Sphere": {"EP": [...], "DE": [...]}}.
     with _PLOT_LOCK:
         try:
             _ensure_output_directory(output_dir)
@@ -435,24 +436,68 @@ def generate_benchmark_boxplots(benchmark_scores_dict, output_dir="results_bench
             function_names = list(benchmark_scores_dict.keys())
             if not function_names:
                 return
-            score_distributions = []
-            for func in function_names:
-                raw_scores = np.asarray(benchmark_scores_dict.get(func, []), dtype=float)
-                sanitized = np.nan_to_num(raw_scores, nan=1e-12, posinf=1e6, neginf=1e-12)
-                clipped = np.clip(sanitized, 1e-12, 1e9)
-                score_distributions.append(clipped if len(clipped) > 0 else np.array([1e-12]))
 
-            fig, ax = plt.subplots(figsize=(10, 5.5), dpi=300)
-            try:
-                boxplot_elements = ax.boxplot(score_distributions, tick_labels=function_names, patch_artist=True)
-            except TypeError:
-                boxplot_elements = ax.boxplot(score_distributions, labels=function_names, patch_artist=True)
+            first_val = benchmark_scores_dict[function_names[0]]
+            is_grouped = isinstance(first_val, dict)
 
-            for box in boxplot_elements["boxes"]:
-                box.set(facecolor="#3B8ED0", alpha=0.75)
+            fig, ax = plt.subplots(figsize=(11.5, 5.8), dpi=300)
+
+            if is_grouped:
+                algo_names = list(first_val.keys())
+                n_algos = max(1, len(algo_names))
+                x_centers = np.arange(len(function_names), dtype=float)
+                total_group_width = 0.68
+                box_width = total_group_width / n_algos
+                palette = ["#D62728", "#1F77B4", "#2CA02C", "#9467BD"]
+                legend_handles = []
+
+                for a_idx, algo_label in enumerate(algo_names):
+                    offset = (a_idx - (n_algos - 1) / 2.0) * (box_width + 0.04)
+                    positions = x_centers + offset
+                    distributions = []
+                    for func in function_names:
+                        raw_scores = np.asarray(benchmark_scores_dict.get(func, {}).get(algo_label, []), dtype=float)
+                        sanitized = np.nan_to_num(raw_scores, nan=1e-18, posinf=1e6, neginf=1e-18)
+                        clipped = np.clip(sanitized, 1e-18, 1e9)
+                        distributions.append(clipped if len(clipped) > 0 else np.array([1e-18]))
+
+                    bp = ax.boxplot(
+                        distributions,
+                        positions=positions,
+                        widths=box_width,
+                        patch_artist=True,
+                        manage_ticks=False
+                    )
+                    color = palette[a_idx % len(palette)]
+                    for box in bp["boxes"]:
+                        box.set(facecolor=color, alpha=0.75, edgecolor="black")
+                    for median in bp["medians"]:
+                        median.set(color="black", linewidth=1.6)
+                    legend_handles.append(bp["boxes"][0])
+
+                ax.set_xticks(x_centers)
+                ax.set_xticklabels(function_names, fontsize=10.5)
+                ax.set_xlim(-0.6, len(function_names) - 0.4)
+                ax.legend(legend_handles, algo_names, loc="upper left", frameon=True, fontsize=10)
+                ax.set_title("Head-to-Head Benchmark Performance Distribution (EP vs. DE)", fontsize=13, fontweight="bold")
+            else:
+                score_distributions = []
+                for func in function_names:
+                    raw_scores = np.asarray(benchmark_scores_dict.get(func, []), dtype=float)
+                    sanitized = np.nan_to_num(raw_scores, nan=1e-18, posinf=1e6, neginf=1e-18)
+                    clipped = np.clip(sanitized, 1e-18, 1e9)
+                    score_distributions.append(clipped if len(clipped) > 0 else np.array([1e-18]))
+
+                try:
+                    boxplot_elements = ax.boxplot(score_distributions, tick_labels=function_names, patch_artist=True)
+                except TypeError:
+                    boxplot_elements = ax.boxplot(score_distributions, labels=function_names, patch_artist=True)
+
+                for box in boxplot_elements["boxes"]:
+                    box.set(facecolor="#3B8ED0", alpha=0.75)
+                ax.set_title("Optimization Performance on Benchmark Test Functions", fontsize=13, fontweight="bold")
 
             ax.set_yscale("log")
-            ax.set_title("Optimization Performance on Benchmark Test Functions", fontsize=13, fontweight="bold")
             ax.set_xlabel("Test Function", fontsize=11)
             ax.set_ylabel("Final Objective Value [Log Scale]", fontsize=11)
             ax.grid(True, which="both", linestyle="--", alpha=0.35)
@@ -638,34 +683,67 @@ def generate_multi_model_comparison_plots(actual_targets, model_predictions_dict
             plt.close(fig_c_min)
 
             # 3. Validation metrics bar chart
-            metrics_to_plot = [
+            candidate_metrics = [
                 ("MSE", "Mean Squared Error (MSE)", "{:.4f}"),
                 ("RMSE", "Root Mean Squared Error (RMSE)", "{:.4f}"),
+                ("MAE", "Mean Absolute Error (MAE)", "{:.4f}"),
                 ("MAPE", "Mean Absolute Percentage Error (%)", "{:.2f}%"),
-                ("R-Squared", "Coefficient of Determination ($R^2$)", "{:.4f}")
+                ("R-Squared", "Coefficient of Determination ($R^2$)", "{:.4f}"),
+                ("VAF_Pct", "Variance Accounted For (VAF %)", "{:.2f}%"),
+                ("AICc", "Corrected AIC ($AIC_c$)", "{:.1f}"),
+                ("White_Noise_Pct", "White-Noise ACF Pass Rate (%)", "{:.1f}%"),
+                ("CCF_Pass_Pct", "Input-Residual Cross-Correlation (%)", "{:.1f}%"),
+                ("Sim_Fit_Pct", "Autonomous Simulation Fit (%)", "{:.1f}%"),
+                ("Sim_RMSE", "Autonomous Simulation RMSE", "{:.4f}"),
+                ("FE", "Fitness Evaluations (FE)", "{:,.0f}"),
+                ("Execution_Time_Sec", "Training Wall-Clock Time (s)", "{:.2f}s"),
+                ("Cost_Per_FE_ms", "Cost per Evaluation (ms/FE)", "{:.3f}ms"),
             ]
+            metrics_to_plot = []
+            for key, title, fmt in candidate_metrics:
+                has_metric = any(
+                    (key in model_metrics_dict.get(lbl, {}) and np.isfinite(_safe_float(model_metrics_dict[lbl].get(key), fallback=np.nan)))
+                    for lbl in model_labels
+                )
+                if has_metric:
+                    metrics_to_plot.append((key, title, fmt))
 
-            fig3, axes = plt.subplots(2, 2, figsize=(max(13, num_models * 2.4), 9), dpi=300)
-            axes_flat = axes.flatten()
+            if not metrics_to_plot:
+                metrics_to_plot = [
+                    ("MSE", "Mean Squared Error (MSE)", "{:.4f}"),
+                    ("RMSE", "Root Mean Squared Error (RMSE)", "{:.4f}"),
+                    ("MAPE", "Mean Absolute Percentage Error (%)", "{:.2f}%"),
+                    ("R-Squared", "Coefficient of Determination ($R^2$)", "{:.4f}")
+                ]
+
+            n_m = len(metrics_to_plot)
+            n_cols = 4 if n_m >= 7 else (3 if n_m in (5, 6) else 2)
+            n_rows = int(np.ceil(n_m / n_cols))
+
+            fig3, axes = plt.subplots(n_rows, n_cols, figsize=(max(4.8 * n_cols, num_models * 1.6 * n_cols), 4.2 * n_rows), dpi=300)
+            axes_flat = np.atleast_1d(axes).flatten()
             x_pos = np.arange(num_models)
 
-            for ax, (metric_key, metric_title, fmt_str) in zip(axes_flat, metrics_to_plot):
+            for idx_m, (metric_key, metric_title, fmt_str) in enumerate(metrics_to_plot):
+                ax = axes_flat[idx_m]
                 values = [_safe_float(model_metrics_dict.get(label, {}).get(metric_key), fallback=np.nan) for label in model_labels]
                 bars = ax.bar(x_pos, values, color=model_colors, alpha=0.85, edgecolor="black", width=0.55)
-                ax.set_title(metric_title, fontsize=12, fontweight="bold")
+                ax.set_title(metric_title, fontsize=11, fontweight="bold")
                 ax.set_xticks(x_pos)
-                ax.set_xticklabels(model_labels, rotation=20 if num_models > 3 else 0, ha="right" if num_models > 3 else "center", fontsize=9.5)
+                ax.set_xticklabels(model_labels, rotation=20 if num_models > 3 else 0, ha="right" if num_models > 3 else "center", fontsize=9)
                 ax.grid(True, axis="y", linestyle="--", alpha=0.35)
 
                 for bar, val in zip(bars, values):
                     if np.isfinite(val):
                         height = bar.get_height()
+                        va = "bottom" if height >= 0 else "top"
+                        y_offset = 4 if height >= 0 else -4
                         ax.annotate(
                             fmt_str.format(val),
                             xy=(bar.get_x() + bar.get_width() / 2, height),
-                            xytext=(0, 4),
+                            xytext=(0, y_offset),
                             textcoords="offset points",
-                            ha="center", va="bottom", fontsize=9, fontweight="bold"
+                            ha="center", va=va, fontsize=8.5, fontweight="bold"
                         )
                     else:
                         ax.annotate(
@@ -673,12 +751,16 @@ def generate_multi_model_comparison_plots(actual_targets, model_predictions_dict
                             xy=(bar.get_x() + bar.get_width() / 2, 0),
                             xytext=(0, 4),
                             textcoords="offset points",
-                            ha="center", va="bottom", fontsize=9, fontweight="bold", color="#D62728"
+                            ha="center", va="bottom", fontsize=8.5, fontweight="bold", color="#D62728"
                         )
 
                 y_min, y_max = ax.get_ylim()
                 if np.isfinite(y_min) and np.isfinite(y_max):
-                    ax.set_ylim(y_min, y_max + 0.14 * (abs(y_max - y_min) if y_max != y_min else 1.0))
+                    span = abs(y_max - y_min) if y_max != y_min else 1.0
+                    ax.set_ylim(y_min - 0.06 * span if y_min < 0 else 0, y_max + 0.16 * span)
+
+            for idx_empty in range(n_m, len(axes_flat)):
+                axes_flat[idx_empty].set_visible(False)
 
             plt.suptitle(f"Multi-Model Validation Metrics Comparison — {dataset_name}", fontsize=14, fontweight="bold")
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
@@ -697,12 +779,14 @@ def generate_multi_model_comparison_plots(actual_targets, model_predictions_dict
                 for bar, val in zip(bars, values):
                     if np.isfinite(val):
                         height = bar.get_height()
+                        va = "bottom" if height >= 0 else "top"
+                        y_offset = 4 if height >= 0 else -4
                         ax_sb.annotate(
                             fmt_str.format(val),
                             xy=(bar.get_x() + bar.get_width() / 2, height),
-                            xytext=(0, 4),
+                            xytext=(0, y_offset),
                             textcoords="offset points",
-                            ha="center", va="bottom", fontsize=9, fontweight="bold"
+                            ha="center", va=va, fontsize=9, fontweight="bold"
                         )
                     else:
                         ax_sb.annotate(
@@ -714,7 +798,8 @@ def generate_multi_model_comparison_plots(actual_targets, model_predictions_dict
                         )
                 y_min, y_max = ax_sb.get_ylim()
                 if np.isfinite(y_min) and np.isfinite(y_max):
-                    ax_sb.set_ylim(y_min, y_max + 0.14 * (abs(y_max - y_min) if y_max != y_min else 1.0))
+                    span = abs(y_max - y_min) if y_max != y_min else 1.0
+                    ax_sb.set_ylim(y_min - 0.06 * span if y_min < 0 else 0, y_max + 0.16 * span)
                 metric_slug = metric_key.lower().replace("-", "").replace(" ", "_")
                 fig_sb.savefig(os.path.join(output_dir, f"comparison_bar_{metric_slug}_{dataset_name}.png"), bbox_inches="tight", dpi=300)
                 plt.close(fig_sb)
@@ -1237,5 +1322,521 @@ def generate_bode_diagram(theta_weights, na, nb, nc, nk, dataset_name, fold_num,
                     plt.close(fig_pz_s)
                 except Exception as e:
                     print(f"[!] Warning: Could not generate Bode plot for channel {out_ch + 1}: {e}")
+        finally:
+            plt.close("all")
+
+
+def generate_benchmark_convergence_comparison(
+    convergence_histories_dict,
+    output_dir="results_benchmarks",
+    filename="benchmark_convergence_comparison.png",
+    suptitle="Benchmark Convergence Comparison (Mean +/- 1 SD Across Trials)"
+):
+    """
+    Plots multi-trial convergence curves (Mean +/- 1 SD in log scale) across all benchmark functions
+    comparing EP against Differential Evolution (or comparing different operator configurations).
+    convergence_histories_dict: {
+        "Sphere": {"EP (Gaussian)": np.ndarray(trials, gens), "Differential Evolution": np.ndarray(trials, gens)},
+        ...
+    }
+    """
+    with _PLOT_LOCK:
+        try:
+            _ensure_output_directory(output_dir)
+            if not convergence_histories_dict:
+                return
+
+            func_names = list(convergence_histories_dict.keys())
+            n_funcs = len(func_names)
+            cols = 3
+            rows = max(1, (n_funcs + cols - 1) // cols)
+
+            fig, axes = plt.subplots(rows, cols, figsize=(16, 5.2 * rows), dpi=300)
+            axes_flat = np.atleast_1d(axes).flatten()
+            colors = ["#D62728", "#1F77B4", "#2CA02C", "#9467BD", "#FF7F0E", "#8C564B"]
+            linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 2))]
+
+            for idx, f_name in enumerate(func_names):
+                ax = axes_flat[idx]
+                algo_map = convergence_histories_dict[f_name]
+                for a_idx, (algo_label, mat) in enumerate(algo_map.items()):
+                    arr = np.asarray(mat, dtype=float)
+                    if arr.ndim == 1:
+                        arr = arr.reshape(1, -1)
+                    safe_arr = np.clip(np.nan_to_num(arr, nan=1e-18, posinf=1e6, neginf=1e-18), 1e-18, 1e9)
+                    mean_curve = np.mean(safe_arr, axis=0)
+                    # Compute symmetric dispersion envelope in log10 space so +/- 1 SD never turns negative
+                    # or drops vertically to the bottom of the logarithmic axis
+                    log_std = np.std(np.log10(safe_arr), axis=0)
+                    lower_band = np.maximum(mean_curve * (10.0 ** (-log_std)), 1e-18)
+                    upper_band = np.minimum(mean_curve * (10.0 ** log_std), 1e9)
+                    gens = np.arange(len(mean_curve))
+
+                    c = colors[a_idx % len(colors)]
+                    ls = linestyles[a_idx % len(linestyles)]
+                    ax.plot(gens, mean_curve, label=algo_label, color=c, linestyle=ls, linewidth=2.0)
+                    ax.fill_between(
+                        gens,
+                        lower_band,
+                        upper_band,
+                        color=c, alpha=0.16
+                    )
+
+                ax.set_title(f"{f_name}", fontsize=12.5, fontweight="bold")
+                ax.set_xlabel("Generation", fontsize=10.5)
+                ax.set_ylabel("Best Objective Value [Log Scale]", fontsize=10.5)
+                ax.set_yscale("log")
+                ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, _: f"{y:.4g}"))
+                ax.yaxis.set_minor_formatter(ticker.NullFormatter())
+                ax.grid(True, which="both", linestyle="--", alpha=0.35)
+                ax.legend(loc="upper right", frameon=True, fontsize=8.5)
+
+            for extra_ax in axes_flat[n_funcs:]:
+                extra_ax.set_visible(False)
+
+            plt.suptitle(suptitle, fontsize=14, fontweight="bold")
+            plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+            fig.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=300)
+            plt.close(fig)
+        finally:
+            plt.close("all")
+
+
+def generate_sensitivity_analysis_plots(
+    sensitivity_records,
+    output_dir="results_sensitivity",
+    metric_key="RMSE",
+    metric_label="Validation RMSE",
+    filename="parameter_sensitivity_overview.png",
+    title_suffix=""
+):
+    """
+    Plots One-Factor-At-A-Time (OFAT) parameter sensitivity profiles showing both
+    solution quality (mean +/- SD) and execution time (seconds) for each tested parameter.
+    """
+    with _PLOT_LOCK:
+        try:
+            _ensure_output_directory(output_dir)
+            if not sensitivity_records:
+                return
+
+            grouped = {}
+            for rec in sensitivity_records:
+                p_name = rec.get("parameter_name", "Parameter")
+                grouped.setdefault(p_name, []).append(rec)
+
+            param_names = list(grouped.keys())
+            n_params = len(param_names)
+            cols = min(3, n_params)
+            rows = max(1, (n_params + cols - 1) // cols)
+
+            fig, axes = plt.subplots(rows, cols, figsize=(5.6 * cols, 4.8 * rows), dpi=300)
+            axes_flat = np.atleast_1d(axes).flatten()
+
+            for idx, p_name in enumerate(param_names):
+                ax1 = axes_flat[idx]
+                items = grouped[p_name]
+                x_labels = [str(it["parameter_value"]) for it in items]
+                x_pos = np.arange(len(x_labels))
+
+                y_mean = np.array([float(it.get(f"{metric_key}_mean", 0.0)) for it in items], dtype=float)
+                y_std = np.array([float(it.get(f"{metric_key}_std", 0.0)) for it in items], dtype=float)
+                t_mean = np.array([float(it.get("time_mean", 0.0)) for it in items], dtype=float)
+
+                ax1.errorbar(
+                    x_pos, y_mean, yerr=y_std, fmt="-o", color="#D62728",
+                    ecolor="#D62728", elinewidth=1.6, capsize=4, linewidth=2.0, markersize=6,
+                    label=f"{metric_label} (Mean +/- SD)"
+                )
+                ax1.set_title(f"Sensitivity: {p_name}", fontsize=12, fontweight="bold")
+                ax1.set_xlabel(p_name, fontsize=10.5)
+                ax1.set_ylabel(metric_label, color="#D62728", fontsize=10.5)
+                ax1.set_xticks(x_pos)
+                ax1.set_xticklabels(x_labels)
+                ax1.tick_params(axis="y", labelcolor="#D62728")
+                ax1.grid(True, linestyle="--", alpha=0.35)
+
+                ax2 = ax1.twinx()
+                ax2.plot(x_pos, t_mean, "--s", color="#1F77B4", linewidth=1.8, markersize=5.5, label="Exec Time (s)")
+                ax2.set_ylabel("Mean Execution Time (s)", color="#1F77B4", fontsize=10.5)
+                ax2.tick_params(axis="y", labelcolor="#1F77B4")
+
+            for extra_ax in axes_flat[n_params:]:
+                extra_ax.set_visible(False)
+
+            plt.suptitle(f"Hyperparameter Sensitivity Analysis ({metric_label} vs. Execution Time){title_suffix}", fontsize=13.5, fontweight="bold")
+            plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+            fig.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=300)
+            plt.close(fig)
+        finally:
+            plt.close("all")
+
+
+def generate_dimensional_scalability_plots(
+    scalability_records,
+    output_dir="results_scalability",
+    filename="study_3_dimensional_scalability.png"
+):
+    """
+    Plots a 2x3 grid of Final Objective Value (Mean +/- 1 SD in log10 space) vs. Problem Dimension D
+    comparing Self-Adaptive EP and Differential Evolution across all 6 benchmark topologies.
+    """
+    with _PLOT_LOCK:
+        try:
+            _ensure_output_directory(output_dir)
+            if not scalability_records:
+                return
+
+            grouped = {}
+            for rec in scalability_records:
+                fn = rec["Function"]
+                grouped.setdefault(fn, []).append(rec)
+
+            func_names = list(grouped.keys())
+            n_funcs = len(func_names)
+            cols = 3
+            rows = max(1, (n_funcs + cols - 1) // cols)
+
+            fig, axes = plt.subplots(rows, cols, figsize=(16, 5.2 * rows), dpi=300)
+            axes_flat = np.atleast_1d(axes).flatten()
+
+            for idx, fn in enumerate(func_names):
+                ax = axes_flat[idx]
+                recs = sorted(grouped[fn], key=lambda r: int(r["Dimensions"]))
+                dims = np.array([int(r["Dimensions"]) for r in recs], dtype=int)
+
+                ep_means = np.clip(np.array([float(r["EP_Mean"]) for r in recs], dtype=float), 1e-18, 1e9)
+                ep_stds = np.array([float(r["EP_Std"]) for r in recs], dtype=float)
+                de_means = np.clip(np.array([float(r["DE_Mean"]) for r in recs], dtype=float), 1e-18, 1e9)
+                de_stds = np.array([float(r["DE_Std"]) for r in recs], dtype=float)
+
+                ax.plot(dims, ep_means, "-o", color="#D62728", linewidth=2.0, markersize=6, label="Self-Adaptive EP")
+                ax.fill_between(
+                    dims,
+                    np.maximum(ep_means * 0.5, ep_means - 0.5 * ep_stds),
+                    ep_means + ep_stds,
+                    color="#D62728", alpha=0.15
+                )
+
+                ax.plot(dims, de_means, "--s", color="#1F77B4", linewidth=2.0, markersize=6, label="Differential Evolution (DE)")
+                ax.fill_between(
+                    dims,
+                    np.maximum(de_means * 0.5, de_means - 0.5 * de_stds),
+                    de_means + de_stds,
+                    color="#1F77B4", alpha=0.15
+                )
+
+                ax.set_title(f"{fn} — Dimensional Scaling", fontsize=12.5, fontweight="bold")
+                ax.set_xlabel("Problem Dimension (D)", fontsize=10.5)
+                ax.set_ylabel("Mean Final Objective [Log Scale]", fontsize=10.5)
+                ax.set_xticks(dims)
+                ax.set_yscale("log")
+                ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, _: f"{y:.4g}"))
+                ax.yaxis.set_minor_formatter(ticker.NullFormatter())
+                ax.grid(True, which="both", linestyle="--", alpha=0.35)
+                ax.legend(loc="best", frameon=True, fontsize=8.8)
+
+            for extra_ax in axes_flat[n_funcs:]:
+                extra_ax.set_visible(False)
+
+            plt.suptitle("Study 3: Dimensional Scalability Analysis (EP vs. DE Across D = 2..30 under Fixed N_pop)", fontsize=14, fontweight="bold")
+            plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+            fig.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=300)
+            plt.close(fig)
+        finally:
+            plt.close("all")
+
+
+def generate_sysid_study_comparison_plots(
+    study_histories_dict,
+    fold_rmse_dict,
+    output_dir="results_study",
+    filename="sysid_study_comparison.png",
+    suptitle="System Identification Study: Convergence (FE & Wall-Clock Time) and Fold RMSE Distribution"
+):
+    """
+    Generates a 3-panel comparative figure for SysId experimental studies (Study 1 & Study 4):
+      (a) Validation/Training MSE Convergence vs. Fitness Evaluations (FE)
+      (b) Validation/Training MSE Convergence vs. Wall-Clock Time (s)
+      (c) 10-Fold Validation RMSE Boxplot + Individual Fold Scatter
+    """
+    with _PLOT_LOCK:
+        try:
+            _ensure_output_directory(output_dir)
+            if not study_histories_dict and not fold_rmse_dict:
+                return
+
+            fig, (ax_fe, ax_time, ax_box) = plt.subplots(1, 3, figsize=(18.5, 5.6), dpi=300)
+            colors = ["#D62728", "#1F77B4", "#2CA02C", "#9467BD", "#FF7F0E", "#8C564B"]
+            linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 2))]
+
+            min_final_time = None
+            for idx, (label, data_dict) in enumerate(study_histories_dict.items()):
+                mse_mat = np.asarray(data_dict.get("mse_matrix", []), dtype=float)
+                fe_axis = np.asarray(data_dict.get("fe_axis", []), dtype=float)
+                time_axis = np.asarray(data_dict.get("time_axis", []), dtype=float)
+                if mse_mat.size == 0:
+                    continue
+                if mse_mat.ndim == 1:
+                    mse_mat = mse_mat.reshape(1, -1)
+
+                safe_mat = np.clip(np.nan_to_num(mse_mat, nan=1e-12, posinf=1e6, neginf=1e-12), 1e-12, 1e9)
+                mean_curve = np.mean(safe_mat, axis=0)
+                log_std = np.std(np.log10(safe_mat), axis=0)
+                lower_band = np.maximum(mean_curve * (10.0 ** (-log_std)), 1e-12)
+                upper_band = np.minimum(mean_curve * (10.0 ** log_std), 1e9)
+
+                if len(fe_axis) != len(mean_curve):
+                    fe_axis = np.linspace(150, 150 * len(mean_curve), len(mean_curve))
+                if len(time_axis) != len(mean_curve):
+                    time_axis = np.linspace(0.0, float(data_dict.get("mean_time", len(mean_curve))), len(mean_curve))
+
+                if time_axis[-1] > 0:
+                    min_final_time = time_axis[-1] if min_final_time is None else min(min_final_time, time_axis[-1])
+
+                c = colors[idx % len(colors)]
+                ls = linestyles[idx % len(linestyles)]
+                clean_lbl = str(label).replace("_", "-")
+
+                # Panel (a): MSE vs. FE
+                ax_fe.plot(fe_axis, mean_curve, label=clean_lbl, color=c, linestyle=ls, linewidth=2.0)
+                ax_fe.fill_between(fe_axis, lower_band, upper_band, color=c, alpha=0.14)
+
+                # Panel (b): MSE vs. Wall-Clock Time (s)
+                ax_time.plot(time_axis, mean_curve, label=f"{clean_lbl} ({time_axis[-1]:.1f}s)", color=c, linestyle=ls, linewidth=2.0)
+                ax_time.fill_between(time_axis, lower_band, upper_band, color=c, alpha=0.14)
+
+            if min_final_time is not None and min_final_time > 0:
+                ax_time.axvline(
+                    min_final_time, color="#333333", linestyle=":", linewidth=1.4,
+                    label=f"Fastest Budget Cutoff ({min_final_time:.1f}s)"
+                )
+
+            ax_fe.set_title("(a) Convergence vs. Fitness Evaluations", fontsize=12, fontweight="bold")
+            ax_fe.set_xlabel("Cumulative Fitness Evaluations (FE)", fontsize=10.5)
+            ax_fe.set_ylabel("Best Validation/Training MSE [Log Scale]", fontsize=10.5)
+            ax_fe.set_yscale("log")
+            ax_fe.grid(True, which="both", linestyle="--", alpha=0.35)
+            ax_fe.legend(loc="upper right", frameon=True, fontsize=8.5)
+
+            ax_time.set_title("(b) Convergence vs. Wall-Clock Time", fontsize=12, fontweight="bold")
+            ax_time.set_xlabel("Mean Wall-Clock Time per Fold (s)", fontsize=10.5)
+            ax_time.set_ylabel("Best Validation/Training MSE [Log Scale]", fontsize=10.5)
+            ax_time.set_yscale("log")
+            ax_time.grid(True, which="both", linestyle="--", alpha=0.35)
+            ax_time.legend(loc="upper right", frameon=True, fontsize=8.5)
+
+            # Panel (c): 10-Fold Validation RMSE Boxplot
+            if fold_rmse_dict:
+                labels = list(fold_rmse_dict.keys())
+                short_labels = [str(k).replace("_", "\n") for k in labels]
+                distributions = [np.asarray(fold_rmse_dict[k], dtype=float) for k in labels]
+                try:
+                    bp = ax_box.boxplot(distributions, tick_labels=short_labels, patch_artist=True, widths=0.5)
+                except TypeError:
+                    bp = ax_box.boxplot(distributions, labels=short_labels, patch_artist=True, widths=0.5)
+
+                for i, box in enumerate(bp["boxes"]):
+                    c = colors[i % len(colors)]
+                    box.set(facecolor=c, alpha=0.72, edgecolor="black")
+                    y_vals = distributions[i]
+                    x_jitter = np.random.normal(i + 1, 0.05, size=len(y_vals))
+                    ax_box.scatter(x_jitter, y_vals, color="black", alpha=0.65, s=18, zorder=5)
+                for median in bp["medians"]:
+                    median.set(color="black", linewidth=1.8)
+
+                ax_box.set_title("(c) 10-Fold Validation RMSE Distribution", fontsize=12, fontweight="bold")
+                ax_box.set_ylabel("Validation RMSE", fontsize=10.5)
+                ax_box.tick_params(axis="x", labelsize=8.0)
+                ax_box.grid(True, axis="y", linestyle="--", alpha=0.35)
+
+            plt.suptitle(suptitle, fontsize=13.5, fontweight="bold")
+            plt.tight_layout(rect=[0, 0.02, 1, 0.94])
+            fig.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=300)
+            plt.close(fig)
+        finally:
+            plt.close("all")
+
+
+def generate_studies_overview_dashboard(
+    df_s1_sysid=None,
+    df_s2_sens=None,
+    df_s3_scale=None,
+    df_s4_fair=None,
+    output_dir="results_studies_overview",
+    filename="studies_overview_dashboard.png"
+):
+    """
+    Generates a 2x2 overview dashboard comparing all 4 experimental studies:
+      (a) Study 1: Operator Ablation Validation RMSE (Mean +/- SD)
+      (b) Study 2: Hyperparameter Sensitivity Impact Range (Delta RMSE across levels)
+      (c) Study 3: Dimensional Scalability (Overall & Multimodal A12 Effect Size across D)
+      (d) Study 4: Equal-Budget Model Comparison (Validation RMSE vs. ms/FE cost)
+    """
+    with _PLOT_LOCK:
+        try:
+            _ensure_output_directory(output_dir)
+            fig, axes = plt.subplots(2, 2, figsize=(16, 11), dpi=300)
+            ax_s1, ax_s2, ax_s3, ax_s4 = axes.flatten()
+
+            # Panel 1: Study 1 Operator Ablation (Supports Single Model or Multi-Model Grouped Bars with Per-Model Best Highlighted)
+            if df_s1_sysid is not None and not df_s1_sysid.empty and "RMSE_Mean" in df_s1_sysid.columns:
+                models_in_s1 = list(df_s1_sysid["Model"].unique()) if "Model" in df_s1_sysid.columns else ["Model"]
+                if len(models_in_s1) <= 1:
+                    labels = [str(c).replace("_", "\n") for c in df_s1_sysid["Configuration"]]
+                    x_pos = np.arange(len(labels))
+                    means = df_s1_sysid["RMSE_Mean"].values.astype(float)
+                    stds = df_s1_sysid["RMSE_Std"].values.astype(float) if "RMSE_Std" in df_s1_sysid.columns else np.zeros_like(means)
+                    bars = ax_s1.bar(x_pos, means, yerr=stds, capsize=4, color="#3B8ED0", alpha=0.85, edgecolor="black", width=0.55)
+                    best_i = int(np.argmin(means))
+                    bars[best_i].set_facecolor("#2CA02C")
+                    m_tag = f" [{models_in_s1[0]}]" if models_in_s1[0] != "Model" else ""
+                    ax_s1.set_xticks(x_pos)
+                    ax_s1.set_xticklabels(labels, fontsize=8.0)
+                    ax_s1.set_title(f"(a) Study 1: Operator Ablation{m_tag} (Green = Best)", fontsize=12, fontweight="bold")
+                else:
+                    configs = list(df_s1_sysid["Configuration"].unique())
+                    short_cfgs = [str(c).replace("_", "\n") for c in configs]
+                    x_pos = np.arange(len(configs))
+                    n_m = len(models_in_s1)
+                    bar_w = 0.72 / n_m
+                    m_colors = ["#1F77B4", "#FF7F0E", "#9467BD", "#8C564B"]
+                    for m_idx, m_name in enumerate(models_in_s1):
+                        m_df = df_s1_sysid[df_s1_sysid["Model"] == m_name].set_index("Configuration")
+                        means = np.array([float(m_df.loc[c, "RMSE_Mean"]) if c in m_df.index else np.nan for c in configs], dtype=float)
+                        stds = np.array([float(m_df.loc[c, "RMSE_Std"]) if (c in m_df.index and "RMSE_Std" in m_df.columns) else 0.0 for c in configs], dtype=float)
+                        offset = (m_idx - (n_m - 1) / 2.0) * bar_w
+                        bars = ax_s1.bar(
+                            x_pos + offset, means, yerr=stds, capsize=2.5,
+                            width=bar_w * 0.92, color=m_colors[m_idx % len(m_colors)],
+                            alpha=0.82, edgecolor="black", label=str(m_name)
+                        )
+                        if np.any(np.isfinite(means)):
+                            best_i = int(np.nanargmin(means))
+                            bars[best_i].set_facecolor("#2CA02C")
+                            bars[best_i].set_linewidth(1.8)
+                    ax_s1.set_xticks(x_pos)
+                    ax_s1.set_xticklabels(short_cfgs, fontsize=7.5)
+                    ax_s1.legend(loc="upper right", frameon=True, fontsize=8.5)
+                    ax_s1.set_title("(a) Study 1: Operator Ablation by Model (Green = Model Best)", fontsize=11.5, fontweight="bold")
+                ax_s1.set_ylabel("10-Fold Validation RMSE", fontsize=10.5)
+                ax_s1.grid(True, axis="y", linestyle="--", alpha=0.35)
+            else:
+                ax_s1.text(0.5, 0.5, "Study 1 Data Not Available", ha="center", va="center", fontsize=11)
+                ax_s1.set_title("(a) Study 1: Evolutionary Operator Ablation", fontsize=12, fontweight="bold")
+
+            # Panel 2: Study 2 Hyperparameter Sensitivity Impact (Per-Model Delta RMSE & Optimal Values)
+            if df_s2_sens is not None and not df_s2_sens.empty and "RMSE_mean" in df_s2_sens.columns:
+                models_in_s2 = list(df_s2_sens["Model"].unique()) if "Model" in df_s2_sens.columns else ["Model"]
+                if len(models_in_s2) <= 1:
+                    impacts = []
+                    for p_name, grp in df_s2_sens.groupby("parameter_name", sort=False):
+                        vals = grp["RMSE_mean"].values.astype(float)
+                        span = float(np.max(vals) - np.min(vals))
+                        best_v = grp.loc[grp["RMSE_mean"].idxmin(), "parameter_value"]
+                        impacts.append((f"{p_name}\n(best={best_v:g})", span))
+                    impacts.sort(key=lambda x: x[1], reverse=True)
+                    p_labels = [x[0] for x in impacts]
+                    p_spans = [x[1] for x in impacts]
+                    y_pos = np.arange(len(p_labels))
+                    ax_s2.barh(y_pos, p_spans, color="#FF7F0E", alpha=0.85, edgecolor="black", height=0.55)
+                    ax_s2.set_yticks(y_pos)
+                    ax_s2.set_yticklabels(p_labels, fontsize=9)
+                    ax_s2.invert_yaxis()
+                    m_tag = f" [{models_in_s2[0]}]" if models_in_s2[0] != "Model" else ""
+                    ax_s2.set_title(f"(b) Study 2: Hyperparameter Sensitivity Ranking{m_tag}", fontsize=12, fontweight="bold")
+                else:
+                    param_names = list(df_s2_sens["parameter_name"].unique())
+                    y_pos = np.arange(len(param_names))
+                    n_m = len(models_in_s2)
+                    bar_h = 0.72 / n_m
+                    m_colors = ["#1F77B4", "#FF7F0E", "#2CA02C", "#9467BD"]
+                    best_annotations = {p: [] for p in param_names}
+                    for m_idx, m_name in enumerate(models_in_s2):
+                        m_df = df_s2_sens[df_s2_sens["Model"] == m_name]
+                        spans = []
+                        for p_name in param_names:
+                            p_grp = m_df[m_df["parameter_name"] == p_name]
+                            if not p_grp.empty:
+                                vals = p_grp["RMSE_mean"].values.astype(float)
+                                sp = float(np.max(vals) - np.min(vals))
+                                bv = p_grp.loc[p_grp["RMSE_mean"].idxmin(), "parameter_value"]
+                                spans.append(sp)
+                                best_annotations[p_name].append(f"{m_name}:{bv:g}")
+                            else:
+                                spans.append(0.0)
+                        offset = (m_idx - (n_m - 1) / 2.0) * bar_h
+                        ax_s2.barh(
+                            y_pos + offset, spans, height=bar_h * 0.92,
+                            color=m_colors[m_idx % len(m_colors)], alpha=0.85,
+                            edgecolor="black", label=str(m_name)
+                        )
+                    y_labels = [f"{p}\n({', '.join(best_annotations[p])})" for p in param_names]
+                    ax_s2.set_yticks(y_pos)
+                    ax_s2.set_yticklabels(y_labels, fontsize=7.8)
+                    ax_s2.invert_yaxis()
+                    ax_s2.legend(loc="lower right", frameon=True, fontsize=8.5)
+                    ax_s2.set_title("(b) Study 2: Per-Model OFAT Sensitivity & Optimal Levels", fontsize=11.5, fontweight="bold")
+                ax_s2.set_xlabel(r"Validation RMSE Sensitivity Span ($\max - \min$ Within Model)", fontsize=10.0)
+                ax_s2.grid(True, axis="x", linestyle="--", alpha=0.35)
+            else:
+                ax_s2.text(0.5, 0.5, "Study 2 Data Not Available", ha="center", va="center", fontsize=11)
+                ax_s2.set_title("(b) Study 2: Hyperparameter Sensitivity Ranking", fontsize=12, fontweight="bold")
+
+            # Panel 3: Study 3 Dimensional Scalability (Mean A12 & Multimodal Crossover vs D)
+            if df_s3_scale is not None and not df_s3_scale.empty and "A12_Effect_Size" in df_s3_scale.columns:
+                dim_grp = df_s3_scale.groupby("Dimensions", as_index=False).agg(
+                    mean_a12=("A12_Effect_Size", "mean"),
+                    ep_win_tie_pct=("Winner", lambda s: float(np.mean(s.isin(["EP", "Tie"])) * 100.0))
+                ).sort_values("Dimensions")
+                multimodal_df = df_s3_scale[df_s3_scale["Function"].isin(["Rastrigin", "Schwefel", "Griewank"])]
+                mm_grp = multimodal_df.groupby("Dimensions", as_index=False).agg(
+                    mm_a12=("A12_Effect_Size", "mean")
+                ).sort_values("Dimensions")
+
+                dims = dim_grp["Dimensions"].values.astype(int)
+                ax_s3.plot(dims, dim_grp["mean_a12"].values, "-o", color="#1F77B4", linewidth=2.2, markersize=6, label="Overall Mean $A_{12}$ (All 6 Functions)")
+                if not mm_grp.empty:
+                    ax_s3.plot(mm_grp["Dimensions"].values.astype(int), mm_grp["mm_a12"].values, "-s", color="#D62728", linewidth=2.2, markersize=6, label="Multimodal Mean $A_{12}$ (Rastrigin/Schwefel/Griewank)")
+                ax_s3.axhline(0.5, color="black", linestyle=":", linewidth=1.3, label="Neutral Threshold ($A_{12} = 0.50$)")
+                ax_s3.set_xlabel("Problem Dimension (D)", fontsize=10.5)
+                ax_s3.set_ylabel(r"Vargha-Delaney Effect Size $\hat{A}_{12}$ (>0.5 Favors EP)", fontsize=10.0)
+                ax_s3.set_xticks(dims)
+                ax_s3.set_ylim(-0.05, 1.05)
+                ax_s3.set_title("(c) Study 3: EP vs. DE Effect Size Scaling Across D = 2..30", fontsize=12, fontweight="bold")
+                ax_s3.legend(loc="upper left", frameon=True, fontsize=8.5)
+                ax_s3.grid(True, linestyle="--", alpha=0.35)
+            else:
+                ax_s3.text(0.5, 0.5, "Study 3 Data Not Available", ha="center", va="center", fontsize=11)
+                ax_s3.set_title("(c) Study 3: Dimensional Scalability Stress Test", fontsize=12, fontweight="bold")
+
+            # Panel 4: Study 4 Equal-Budget Model Comparison (RMSE & ms/FE)
+            if df_s4_fair is not None and not df_s4_fair.empty and "RMSE_Mean" in df_s4_fair.columns:
+                m_labels = [str(m).replace("_", "\n") for m in df_s4_fair["Model_Variant"]]
+                x_pos = np.arange(len(m_labels))
+                rmse_m = df_s4_fair["RMSE_Mean"].values.astype(float)
+                rmse_s = df_s4_fair["RMSE_Std"].values.astype(float) if "RMSE_Std" in df_s4_fair.columns else np.zeros_like(rmse_m)
+                cost_ms = df_s4_fair["Cost_Per_FE_ms"].values.astype(float) if "Cost_Per_FE_ms" in df_s4_fair.columns else np.zeros_like(rmse_m)
+
+                ax_s4.bar(x_pos - 0.18, rmse_m, yerr=rmse_s, capsize=4, width=0.34, color="#D62728", alpha=0.85, edgecolor="black", label="Validation RMSE")
+                ax_s4.set_ylabel("Validation RMSE (Lower = Better)", color="#D62728", fontsize=10.5)
+                ax_s4.tick_params(axis="y", labelcolor="#D62728")
+                ax_s4.set_xticks(x_pos)
+                ax_s4.set_xticklabels(m_labels, fontsize=9)
+                ax_s4.grid(True, axis="y", linestyle="--", alpha=0.35)
+
+                ax_s4_r = ax_s4.twinx()
+                ax_s4_r.bar(x_pos + 0.18, cost_ms, width=0.34, color="#1F77B4", alpha=0.75, edgecolor="black", label="Cost (ms / FE)")
+                ax_s4_r.set_ylabel("Computational Cost (ms / FE)", color="#1F77B4", fontsize=10.5)
+                ax_s4_r.tick_params(axis="y", labelcolor="#1F77B4")
+                ax_s4.set_title("(d) Study 4: Equal-Budget Model Comparison (RMSE vs. ms/FE)", fontsize=12, fontweight="bold")
+            else:
+                ax_s4.text(0.5, 0.5, "Study 4 Data Not Available", ha="center", va="center", fontsize=11)
+                ax_s4.set_title("(d) Study 4: Equal-Budget Model Comparison", fontsize=12, fontweight="bold")
+
+            plt.suptitle("Cross-Study Overview Dashboard (Studies 1 - 4)", fontsize=14.5, fontweight="bold")
+            plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+            fig.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=300)
+            plt.close(fig)
         finally:
             plt.close("all")

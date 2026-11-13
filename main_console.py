@@ -17,6 +17,13 @@ import argparse
 import multiprocessing
 from datetime import datetime
 
+# Ensure unbuffered real-time stdout streaming for background process monitoring
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    # Fallback for legacy Python environments
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+
 # Limit linear algebra threads per process so multiprocessing workers don't fight over CPU cores
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -35,12 +42,39 @@ from training_pipeline import (
     generate_results_summary_sheet
 )
 from optimization_benchmarks import run_full_benchmark_suite
+from experimental_studies import (
+    run_operator_ablation_study,
+    run_parameter_sensitivity_study,
+    run_benchmark_optimization_study,
+    run_fair_model_comparison_study,
+    run_overall_studies_comparison
+)
 
 
 def _print_banner(title):
     print("\n" + "=" * 76)
     print(f"  EVOLUTIONARY SYSTEM IDENTIFICATION (EP-SysId) -- {title}")
     print("=" * 76)
+
+
+def _resolve_dataset_key(dataset_input: str) -> str:
+    """
+    Normalizes dataset key input strings to guarantee match across configuration dictionaries.
+    """
+    key_clean = str(dataset_input).strip().lower().replace(" ", "_").replace("-", "_")
+    
+    alias_map = {
+        "uci_energy": "uci_energy_efficiency",
+        "energy": "uci_energy_efficiency",
+        "energy_efficiency": "uci_energy_efficiency",
+        "uci_power": "uci_power_plant",
+        "power": "uci_power_plant",
+        "power_plant": "uci_power_plant",
+        "industrial": "industrial_dryer",
+        "dryer": "industrial_dryer"
+    }
+    
+    return alias_map.get(key_clean, key_clean)
 
 
 def _resolve_dataset(dataset_name, cached_datasets):
@@ -56,10 +90,19 @@ def _resolve_dataset(dataset_name, cached_datasets):
     if dataset_name and dataset_name in cached_datasets:
         return dataset_name, cached_datasets[dataset_name]
 
-    # Case-insensitive or partial match fallback
     if dataset_name:
+        # Direct normalized alias match
+        norm_key = _resolve_dataset_key(dataset_name)
+        for name in cached_datasets:
+            if _resolve_dataset_key(name) == norm_key:
+                return name, cached_datasets[name]
+
+        # Case-insensitive or partial match fallback
         for name in cached_datasets:
             if dataset_name.lower() == name.lower():
+                return name, cached_datasets[name]
+        for name in cached_datasets:
+            if norm_key in _resolve_dataset_key(name) or _resolve_dataset_key(name) in norm_key:
                 return name, cached_datasets[name]
 
     if not cached_datasets:
@@ -278,6 +321,60 @@ def run_gui_command():
         sys.exit(1)
 
 
+def run_study_command(args, config):
+    study_type = args.type.lower()
+    raw_ds = args.dataset or config.get("dataset", "UCI_Power_Plant")
+    norm_ds = _resolve_dataset_key(raw_ds)
+    if "energy" in norm_ds:
+        ds_name = "UCI_Energy_Efficiency"
+    elif "power" in norm_ds:
+        ds_name = "UCI_Power_Plant"
+    else:
+        ds_name = raw_ds
+    m_type = (args.model or config.get("model_type", "ARMAX")).upper()
+    s_mode = (args.mode or config.get("system_mode", "MISO")).upper()
+    pop = int(args.pop or config.get("pop_size", 150))
+    gens = int(args.gens or config.get("num_gen", 100))
+    b_trials = int(getattr(args, "trials", None) or config.get("benchmark_trials", 10))
+
+    study_dirs = {}
+
+    if study_type in ("operators", "operator", "study_1", "all"):
+        _print_banner("STUDY 1: EVOLUTIONARY OPERATOR ABLATION")
+        study_dirs["study_1"] = run_operator_ablation_study(
+            base_config=config, dataset_name=ds_name, model_type=m_type, system_mode=s_mode
+        )
+    if study_type in ("sensitivity", "study_2", "all"):
+        _print_banner("STUDY 2: HYPERPARAMETER SENSITIVITY ANALYSIS (OFAT)")
+        study_dirs["study_2"] = run_parameter_sensitivity_study(
+            base_config=config, dataset_name=ds_name, model_type=m_type, system_mode=s_mode
+        )
+    if study_type in ("benchmarks", "benchmark", "study_3", "all"):
+        _print_banner("STUDY 3: DIMENSIONAL SCALABILITY STRESS TEST (EP vs. DE)")
+        raw_dims = getattr(args, "dimensions", None)
+        if raw_dims is not None:
+            if isinstance(raw_dims, str) and "," in raw_dims:
+                b_dims = [int(x.strip()) for x in raw_dims.split(",") if x.strip()]
+            else:
+                try:
+                    b_dims = [int(raw_dims)]
+                except (ValueError, TypeError):
+                    b_dims = [2, 5, 10, 20, 30]
+        else:
+            b_dims = [2, 5, 10, 20, 30]
+        study_dirs["study_3"] = run_benchmark_optimization_study(
+            base_config=config, dimensions_list=b_dims, total_trials=b_trials
+        )
+    if study_type in ("fair_comparison", "study_4", "all"):
+        _print_banner("STUDY 4: EQUAL-BUDGET COMPARISON (ARMAX vs. MLP vs. SVR)")
+        study_dirs["study_4"] = run_fair_model_comparison_study(
+            base_config=config, dataset_name=ds_name, system_mode=s_mode, pop_size=pop, num_gen=gens
+        )
+    if study_type in ("study_5", "overall", "all"):
+        _print_banner("STUDY 5: OVERALL CROSS-STUDY COMPARISON")
+        run_overall_studies_comparison(study_dirs=study_dirs, base_results_dir="results")
+
+
 def main():
     config = load_hyperparameters("config.json")
 
@@ -300,6 +397,10 @@ Examples:
   python main_console.py evaluate --model results/.../identified_model.pkl
   python main_console.py compare --models m1.pkl m2.pkl --dataset UCI_Energy_Efficiency
   python main_console.py summary --dir results
+  python main_console.py study --type operators --dataset UCI_Power_Plant
+  python main_console.py study --type sensitivity --dataset UCI_Power_Plant
+  python main_console.py study --type benchmarks --dimensions 5 --trials 10
+  python main_console.py study --type fair_comparison --dataset UCI_Power_Plant
   python main_console.py gui
         """
     )
@@ -333,6 +434,29 @@ Examples:
     p_sum = subparsers.add_parser("summary", help="Aggregate all training runs into master CSV and Excel summary sheets")
     p_sum.add_argument("--dir", "-d", type=str, default="results", help="Directory containing training run folders (default: results)")
 
+    # Sub-command: study
+    p_study = subparsers.add_parser("study", help="Run automated thesis & paper experimental studies")
+    p_study.add_argument(
+        "--type", "-t", type=str.lower,
+        choices=[
+            "operators", "operator", "study_1",
+            "sensitivity", "study_2",
+            "benchmarks", "benchmark", "study_3",
+            "fair_comparison", "study_4",
+            "study_5", "overall",
+            "all"
+        ],
+        required=True,
+        help="Study type: 'operators' / 'study_1', 'sensitivity' / 'study_2', 'benchmarks' / 'study_3', 'fair_comparison' / 'study_4', 'study_5' / 'overall', or 'all'"
+    )
+    p_study.add_argument("--dataset", type=str, default="UCI_Energy_Efficiency", help="Target dataset name")
+    p_study.add_argument("--model", type=str.upper, choices=["ARMAX", "MLP", "SVR", "ALL"], default="ARMAX", help="Model type for operator/sensitivity studies (or ALL for ARMAX, MLP, and SVR)")
+    p_study.add_argument("--mode", type=str.upper, choices=["SISO", "MISO", "SIMO", "MIMO"], default="MISO", help="System mode")
+    p_study.add_argument("--dimensions", "-d", type=str, default="2,5,10,20,30", help="Comma-separated dimensions list for Study 3 (default: '2,5,10,20,30')")
+    p_study.add_argument("--trials", type=int, default=10, help="Trials per function for benchmark study (Study 3)")
+    p_study.add_argument("--pop", type=int, default=150, help="Population size for equal-budget comparison")
+    p_study.add_argument("--gens", type=int, default=100, help="Max generations for equal-budget comparison")
+
     # Sub-command: gui
     subparsers.add_parser("gui", help="Launch CustomTkinter desktop GUI")
 
@@ -348,6 +472,8 @@ Examples:
         run_compare_command(args, config)
     elif args.command == "summary":
         run_summary_command(args)
+    elif args.command == "study":
+        run_study_command(args, config)
     elif args.command == "gui":
         run_gui_command()
 

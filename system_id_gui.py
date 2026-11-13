@@ -990,7 +990,9 @@ class EvolutionarySystemIDApp(ctk.CTk):
             fold = payload.get("fold", 1)
             val_mse = payload.get("val_mse", 0.0)
             val_r2 = payload.get("val_r2", 0.0)
-            telem_msg = f"Fold {fold}/{k_folds} Finished  |  Val MSE: {val_mse:.4f}  |  Val R²: {val_r2:.4f}"
+            val_vaf = payload.get("val_vaf")
+            vaf_str = f"  |  Val VAF: {val_vaf:.2f}%" if val_vaf is not None else ""
+            telem_msg = f"Fold {fold}/{k_folds} Finished  |  Val MSE: {val_mse:.4f}  |  Val R²: {val_r2:.4f}{vaf_str}"
             card["telemetry_lbl"].configure(text=telem_msg, text_color=("#1E3A8A", "#93C5FD"))
             if k_folds > 0:
                 card["progress_bar"].set(fold / k_folds)
@@ -1003,9 +1005,11 @@ class EvolutionarySystemIDApp(ctk.CTk):
             card["progress_bar"].set(1.0)
             best_mse = payload.get("best_mse", 0.0)
             best_r2 = payload.get("best_r2", 0.0)
+            best_vaf = payload.get("best_vaf")
             total_time = payload.get("total_time", 0.0)
+            vaf_str = f"  |  VAF: {best_vaf:.2f}%" if best_vaf is not None else ""
             card["telemetry_lbl"].configure(
-                text=f"All {k_folds} Folds Complete  |  Best MSE: {best_mse:.4f}  |  R²: {best_r2:.4f}  |  Total: {total_time:.1f}s",
+                text=f"All {k_folds} Folds Complete  |  Best MSE: {best_mse:.4f}  |  R²: {best_r2:.4f}{vaf_str}  |  Total: {total_time:.1f}s",
                 text_color="#10B981"
             )
             card["close_btn"].pack(side="left")
@@ -1360,9 +1364,10 @@ class EvolutionarySystemIDApp(ctk.CTk):
                         self.hyperparameter_inputs[param_key].insert(0, str(architecture[param_key]))
             self._safe_after(_update_ui)
 
+            vaf_str = f" | VAF: {validation_scores['VAF_Pct']:.2f}%" if "VAF_Pct" in validation_scores else ""
             summary_msg = (
                 f"Inference complete! MSE: {validation_scores['MSE']:.4f} | "
-                f"RMSE: {validation_scores['RMSE']:.4f} | R²: {validation_scores['R-Squared']:.4f} "
+                f"RMSE: {validation_scores['RMSE']:.4f} | R²: {validation_scores['R-Squared']:.4f}{vaf_str} "
                 f"-> {output_dir}"
             )
             self._set_status(summary_msg, "cyan")
@@ -1378,8 +1383,10 @@ class EvolutionarySystemIDApp(ctk.CTk):
                 output_dir=output_dir, progress_callback=self._update_status
             )
             winner = ranked_models[0]
+            w_sc = winner["scores"]
+            vaf_str = f", VAF: {w_sc['VAF_Pct']:.2f}%" if "VAF_Pct" in w_sc else ""
             self._set_status(
-                f"Comparison complete ({len(ranked_models)} models)! Winner: {winner['label']} (MSE: {winner['scores']['MSE']:.4f}) -> {output_dir}",
+                f"Comparison complete ({len(ranked_models)} models)! Winner: {winner['label']} (MSE: {w_sc['MSE']:.4f}{vaf_str}) -> {output_dir}",
                 "cyan"
             )
         except Exception as error:
@@ -1410,7 +1417,10 @@ class EvolutionarySystemIDApp(ctk.CTk):
                 exported_path = generate_results_summary_sheet(
                     base_results_dir=target_dir, loaded_datasets=self.loaded_datasets
                 )
-                self._set_status(f"Summary sheet exported to: {exported_path}", "cyan")
+                if exported_path.lower().endswith(".xlsx"):
+                    self._set_status(f"Summary Excel workbook exported to: {exported_path}", "cyan")
+                else:
+                    self._set_status(f"Summary CSV exported (openpyxl not in venv for .xlsx): {exported_path}", "yellow")
             except RuntimeError:
                 def _ask_parent():
                     chosen_dir = filedialog.askdirectory(
@@ -1423,7 +1433,10 @@ class EvolutionarySystemIDApp(ctk.CTk):
                         exported_path = generate_results_summary_sheet(
                             base_results_dir=chosen_dir, loaded_datasets=self.loaded_datasets
                         )
-                        self._set_status(f"Summary sheet exported to: {exported_path}", "cyan")
+                        if exported_path.lower().endswith(".xlsx"):
+                            self._set_status(f"Summary Excel workbook exported to: {exported_path}", "cyan")
+                        else:
+                            self._set_status(f"Summary CSV exported (openpyxl not in venv for .xlsx): {exported_path}", "yellow")
                     except Exception as err:
                         self._set_status(f"Export Error: {str(err)}", "red")
                     finally:
@@ -1841,8 +1854,10 @@ class EvolutionarySystemIDApp(ctk.CTk):
                     output_dir=comp_dir, progress_callback=self._update_status
                 )
                 winner = ranked[0]
+                w_sc = winner["scores"]
+                vaf_str = f", VAF: {w_sc['VAF_Pct']:.2f}%" if "VAF_Pct" in w_sc else ""
                 self._set_status(
-                    f"Batch complete! Winner: {winner['label']} (MSE: {winner['scores']['MSE']:.4f}) -> {comp_dir}",
+                    f"Batch complete! Winner: {winner['label']} (MSE: {w_sc['MSE']:.4f}{vaf_str}) -> {comp_dir}",
                     "cyan"
                 )
             else:
