@@ -1088,7 +1088,7 @@ def _find_latest_study_folder(base_results_dir, prefix):
 
 
 def combine_all_studies_tables(output_dir: str, study_files: list) -> str:
-    """
+    r"""
     Combines individual study LaTeX files into combined_studies_tables.tex while 
     rewriting duplicate \label{...} elements to remain unique across documents.
     """
